@@ -1,195 +1,167 @@
-// Magic link authentication for content access
-// Sends a login email, verifies tokens, sets access cookies
-//
-// Flow:
-//   1. POST /auth/send-link  { email } → sends magic link email
-//   2. GET  /auth/verify?token=xxx    → validates token, sets cookie, redirects
-//   3. GET  /auth/logout              → clears cookie, redirects
-//
-// The cookie (rwstripe_session) maps to an email in plugin storage.
-// Access checks look up email → Stripe customer → verify purchase.
+import type { AuthTokenRecord, MemberSessionState, SessionRecord } from "../types.js";
+import { generateToken, getCookieValue, isRecord, normalizeEmail, nowIso, sanitizeRedirectPath, unwrapStoredRecord } from "../utils.js";
 
-import { StripeClient } from "../stripe.js";
+const AUTH_TOKEN_TTL_MS = 15 * 60 * 1000;
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const SESSION_COOKIE_NAME = "rwstripe_session";
 
-function generateToken(): string {
-  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-  let token = "";
-  for (let i = 0; i < 48; i++) token += chars[Math.floor(Math.random() * chars.length)];
-  return token;
+async function invalidateAuthTokensForEmail(ctx: any, email: string) {
+	const tokens = await ctx.storage.authTokens.query({ where: { email }, limit: 100 });
+	await Promise.all(tokens.items.map((item: { id: string }) => ctx.storage.authTokens.delete(item.id)));
 }
 
-// POST /auth/send-link — sends magic link email
-export async function sendLinkHandler(ctx: any) {
-  const body = ctx.input || {};
-  const email = (body.email || "").trim().toLowerCase();
-
-  if (!email || !email.includes("@")) {
-    return { error: "Valid email required." };
-  }
-
-  // Generate a token that expires in 15 minutes
-  const token = generateToken();
-  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
-
-  // Store the token
-  await ctx.storage.authTokens.put(token, {
-    email,
-    token,
-    expiresAt,
-    used: false,
-    createdAt: new Date().toISOString(),
-  });
-
-  // Build the verify URL — points to the Astro page that handles cookie setting
-  const siteUrl = new URL(ctx.request.url).origin;
-  const verifyUrl = `${siteUrl}/account/verify?token=${encodeURIComponent(token)}&redirect=${encodeURIComponent(body.redirect || "/")}`;
-
-  // Send email via SMTP (localhost:1025 for Mailpit, or configurable)
-  const smtpHost = (await ctx.kv.get("smtp_host")) || "127.0.0.1";
-  const smtpPort = parseInt((await ctx.kv.get("smtp_port")) || "1025", 10);
-  const fromEmail = (await ctx.kv.get("from_email")) || "noreply@emdash.local";
-  const siteName = (await ctx.kv.get("site_name")) || "EmDash Site";
-
-  const emailBody = [
-    `From: ${siteName} <${fromEmail}>`,
-    `To: ${email}`,
-    `Subject: Your login link`,
-    `Content-Type: text/html; charset=utf-8`,
-    ``,
-    `<p>Click the link below to log in:</p>`,
-    `<p><a href="${verifyUrl}" style="display:inline-block;padding:10px 20px;background:#635bff;color:white;text-decoration:none;border-radius:6px;font-weight:500">Log In</a></p>`,
-    `<p style="color:#6b7280;font-size:13px">This link expires in 15 minutes. If you didn't request this, you can safely ignore this email.</p>`,
-  ].join("\r\n");
-
-  try {
-    // Use raw TCP to send via SMTP (works in Node.js runtime)
-    // For Cloudflare Workers, would need a different approach (Resend/SES API)
-    const net = await import("node:net");
-    await new Promise<void>((resolve, reject) => {
-      const socket = net.createConnection(smtpPort, smtpHost, () => {
-        let step = 0;
-        const commands = [
-          `EHLO emdash.local`,
-          `MAIL FROM:<${fromEmail}>`,
-          `RCPT TO:<${email}>`,
-          `DATA`,
-          emailBody + "\r\n.",
-          `QUIT`,
-        ];
-
-        socket.on("data", () => {
-          if (step < commands.length) {
-            socket.write(commands[step] + "\r\n");
-            step++;
-          }
-        });
-
-        socket.on("end", resolve);
-        socket.on("error", reject);
-
-        setTimeout(() => { socket.destroy(); resolve(); }, 5000);
-      });
-    });
-  } catch (err: any) {
-    console.error("[rwstripe] Failed to send email:", err.message);
-    return { error: "Failed to send login email. Check SMTP configuration." };
-  }
-
-  return { ok: true, message: "Check your inbox for a login link." };
+export async function createSession(ctx: any, email: string): Promise<SessionRecord> {
+	const sessionToken = generateToken("rwst_", 32);
+	const session: SessionRecord = {
+		email,
+		sessionToken,
+		expiresAt: new Date(Date.now() + SESSION_TTL_MS).toISOString(),
+		createdAt: nowIso(),
+	};
+	await ctx.storage.sessions.put(sessionToken, session);
+	return session;
 }
 
-// GET /auth/verify — validates token, sets cookie, redirects
-export async function verifyHandler(ctx: any) {
-  const url = new URL(ctx.request.url);
-  const token = url.searchParams.get("token");
-  const redirect = url.searchParams.get("redirect") || "/";
+export async function getSessionRecord(ctx: any): Promise<SessionRecord | null> {
+	const sessionToken = getCookieValue(ctx.request, SESSION_COOKIE_NAME);
+	if (!sessionToken) {
+		return null;
+	}
 
-  if (!token) {
-    return { __html: errorPage("Invalid login link.") };
-  }
+	const session = unwrapStoredRecord<SessionRecord>(await ctx.storage.sessions.get(sessionToken));
+	if (!session) {
+		return null;
+	}
 
-  // Look up the token
-  const record = await ctx.storage.authTokens.get(token);
-  if (!record) {
-    return { __html: errorPage("Login link not found or expired.") };
-  }
+	if (new Date(session.expiresAt).getTime() <= Date.now()) {
+		await ctx.storage.sessions.delete(sessionToken);
+		return null;
+	}
 
-  const data = record.data || record;
-
-  // Check expiration
-  if (new Date(data.expiresAt) < new Date()) {
-    await ctx.storage.authTokens.delete(token);
-    return { __html: errorPage("Login link has expired. Please request a new one.") };
-  }
-
-  // Check if already used
-  if (data.used) {
-    return { __html: errorPage("This login link has already been used.") };
-  }
-
-  // Mark as used
-  await ctx.storage.authTokens.put(token, { ...data, used: true });
-
-  // Generate a session token (long-lived, 30 days)
-  const sessionToken = generateToken();
-  const sessionExpires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-
-  await ctx.storage.sessions.put(sessionToken, {
-    email: data.email,
-    sessionToken,
-    expiresAt: sessionExpires,
-    createdAt: new Date().toISOString(),
-  });
-
-  // Plugin routes always return JSON — we can't return raw HTML or set cookies.
-  // Instead, return the session token and redirect URL. The caller handles it.
-  // For magic link clicks from email: return a redirect URL with the session token
-  // as a query param. The frontend JS captures it and sets the cookie.
-  const sep = redirect.includes("?") ? "&" : "?";
-  const redirectUrl = `${redirect}${sep}rwstripe_session=${encodeURIComponent(sessionToken)}`;
-
-  return { ok: true, redirect: redirectUrl, sessionToken };
+	return session;
 }
 
-// GET /auth/logout — clears session
-export async function logoutHandler(ctx: any) {
-  const url = new URL(ctx.request.url);
-  const redirect = url.searchParams.get("redirect") || "/";
-
-  return {
-    __html: `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Logging out...</title></head><body>
-<script>
-document.cookie = "rwstripe_session=; path=/; max-age=0";
-localStorage.removeItem("rwstripe_token");
-window.location.href = ${JSON.stringify(redirect)};
-</script>
-<p>Logging you out...</p>
-</body></html>`,
-  };
-}
-
-// Helper: look up session from cookie in request
 export async function getSessionEmail(ctx: any): Promise<string | null> {
-  const cookieHeader = ctx.request.headers.get("cookie") || "";
-  const match = cookieHeader.match(/rwstripe_session=([^;]+)/);
-  if (!match) return null;
-
-  const sessionToken = match[1];
-  const record = await ctx.storage.sessions.get(sessionToken);
-  if (!record) return null;
-
-  const data = record.data || record;
-  if (new Date(data.expiresAt) < new Date()) {
-    await ctx.storage.sessions.delete(sessionToken);
-    return null;
-  }
-
-  return data.email;
+	return (await getSessionRecord(ctx))?.email ?? null;
 }
 
-function errorPage(msg: string): string {
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Error</title></head><body style="font-family:system-ui;max-width:400px;margin:4rem auto;text-align:center">
-<h2>Login Error</h2><p style="color:#dc2626">${msg}</p>
-<p><a href="javascript:history.back()">Go back</a></p>
-</body></html>`;
+export async function getSessionState(ctx: any): Promise<MemberSessionState> {
+	const session = await getSessionRecord(ctx);
+	return {
+		authenticated: Boolean(session?.email),
+		email: session?.email ?? null,
+	};
+}
+
+function buildVerifyUrl(ctx: any, token: string, redirect: string): string {
+	const verifyUrl = new URL(ctx.url("/account/verify/"));
+	verifyUrl.searchParams.set("token", token);
+	verifyUrl.searchParams.set("redirect", redirect);
+	return verifyUrl.toString();
+}
+
+function buildEmailMessage(ctx: any, verifyUrl: string, intent: "signin" | "subscribe-free") {
+	const siteName = ctx.site?.name || "EmDash";
+	const actionLabel = intent === "subscribe-free" ? "Confirm your subscription" : "Sign in";
+	const subject = intent === "subscribe-free" ? `Confirm your subscription to ${siteName}` : `Sign in to ${siteName}`;
+	const text = [
+		`${actionLabel} for ${siteName}`,
+		"",
+		`Open this link to continue: ${verifyUrl}`,
+		"",
+		"This link expires in 15 minutes.",
+	].join("\n");
+	const html = [
+		`<p>${actionLabel} for <strong>${siteName}</strong>.</p>`,
+		`<p><a href="${verifyUrl}" style="display:inline-block;padding:10px 20px;background:#111827;color:#ffffff;text-decoration:none;border-radius:999px;font-weight:600">${actionLabel}</a></p>`,
+		"<p style=\"color:#6b7280;font-size:13px\">This link expires in 15 minutes.</p>",
+	].join("");
+
+	return { subject, text, html };
+}
+
+export async function sendLinkHandler(ctx: any) {
+	const body = isRecord(ctx.input) ? ctx.input : {};
+	const email = normalizeEmail(body.email);
+	if (!email) {
+		return { ok: false, error: "A valid email address is required." };
+	}
+	if (!ctx.email) {
+		return { ok: false, error: "Email delivery is not configured for this site yet." };
+	}
+
+	const intent = body.intent === "subscribe-free" ? "subscribe-free" : "signin";
+	const redirect = sanitizeRedirectPath(body.redirect, intent === "subscribe-free" ? "/resources/#subscribe" : "/");
+	const token = generateToken("rwml_", 40);
+	const authToken: AuthTokenRecord = {
+		email,
+		token,
+		redirect,
+		intent,
+		expiresAt: new Date(Date.now() + AUTH_TOKEN_TTL_MS).toISOString(),
+		used: false,
+		createdAt: nowIso(),
+	};
+
+	await invalidateAuthTokensForEmail(ctx, email);
+	await ctx.storage.authTokens.put(token, authToken);
+
+	const verifyUrl = buildVerifyUrl(ctx, token, redirect);
+	const message = buildEmailMessage(ctx, verifyUrl, intent);
+	await ctx.email.send({
+		to: email,
+		subject: message.subject,
+		text: message.text,
+		html: message.html,
+	});
+
+	return {
+		ok: true,
+		message:
+			intent === "subscribe-free"
+				? "Check your inbox to confirm your subscription."
+				: "Check your inbox for a sign-in link.",
+	};
+}
+
+export async function verifyHandler(ctx: any) {
+	const url = new URL(ctx.request.url);
+	const token = url.searchParams.get("token")?.trim();
+	if (!token) {
+		return { ok: false, code: "INVALID_TOKEN", error: "Invalid sign-in link." };
+	}
+
+	const authToken = unwrapStoredRecord<AuthTokenRecord>(await ctx.storage.authTokens.get(token));
+	if (!authToken) {
+		return { ok: false, code: "INVALID_TOKEN", error: "Sign-in link not found or already expired." };
+	}
+	if (authToken.used) {
+		return { ok: false, code: "USED_TOKEN", error: "This sign-in link has already been used." };
+	}
+	if (new Date(authToken.expiresAt).getTime() <= Date.now()) {
+		await ctx.storage.authTokens.delete(token);
+		return { ok: false, code: "EXPIRED_TOKEN", error: "This sign-in link has expired." };
+	}
+
+	await ctx.storage.authTokens.put(token, { ...authToken, used: true });
+	const session = await createSession(ctx, authToken.email);
+
+	return {
+		ok: true,
+		sessionToken: session.sessionToken,
+		expiresAt: session.expiresAt,
+		redirect: sanitizeRedirectPath(url.searchParams.get("redirect") || authToken.redirect, authToken.redirect),
+	};
+}
+
+export async function sessionHandler(ctx: any) {
+	return getSessionState(ctx);
+}
+
+export async function logoutHandler(ctx: any) {
+	const sessionToken = getCookieValue(ctx.request, SESSION_COOKIE_NAME);
+	if (sessionToken) {
+		await ctx.storage.sessions.delete(sessionToken);
+	}
+	return { ok: true };
 }

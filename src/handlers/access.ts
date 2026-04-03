@@ -1,93 +1,198 @@
-// GET access check — returns whether current user can view a content item
-// Mirrors WP rwstripe_get_restricted_products_for_post() + customer_has_product()
+import type { AccessDecision, ContentRestrictionRecord } from "../types.js";
+import { getCustomerRecordByEmail, upsertCustomerRecord } from "../customers.js";
+import { isPaidPlanSlug, type PaidPlanSlug } from "../plans.js";
 import { StripeClient } from "../stripe.js";
+import { isRecord, normalizeStringArray, parsePaidPlanSlugs, uniqueStrings, unwrapStoredRecord } from "../utils.js";
 import { getSessionEmail } from "./auth.js";
+import { loadSettings, resolveRequiredProductIds } from "./settings.js";
 
-export async function accessHandler(ctx: any) {
-  const url = new URL(ctx.request.url);
-  const contentId = url.searchParams.get("contentId");
-  const collectionSlug = url.searchParams.get("collection");
-
-  if (!contentId || !collectionSlug) {
-    return { error: "contentId and collection required" };
-  }
-
-  // Collect all product IDs restricting this content
-  const productIds = await getRestrictedProductIds(ctx, collectionSlug, contentId);
-
-  if (productIds.length === 0) {
-    return { restricted: false, hasAccess: true };
-  }
-
-  // Determine the user's email from (in priority order):
-  //   1. rwstripe_session cookie (magic link login)
-  //   2. emdash logged-in user
-  let email: string | null = null;
-
-  // Check magic link session cookie
-  email = await getSessionEmail(ctx);
-
-  // Fall back to emdash user
-  if (!email && ctx.user?.email) {
-    email = ctx.user.email;
-  }
-
-  if (!email) {
-    return { restricted: true, hasAccess: false, productIds };
-  }
-
-  // Look up Stripe customer by email directly from Stripe API
-  // This is the authoritative check — no local state needed
-  const secretKey = await ctx.kv.get("stripe_secret_key");
-  if (!secretKey) {
-    return { restricted: true, hasAccess: false, error: "Stripe not configured" };
-  }
-
-  const stripe = new StripeClient(secretKey, ctx.http.fetch);
-
-  // Find customer(s) by email in Stripe
-  let customerId: string | null = null;
-  try {
-    const customers = await stripe.getCustomersByEmail(email);
-    if (customers.data && customers.data.length > 0) {
-      // Check each customer (email isn't unique in Stripe)
-      for (const cust of customers.data) {
-        const hasAccess = await stripe.customerHasProduct(cust.id, productIds);
-        if (hasAccess) {
-          return { restricted: true, hasAccess: true, productIds, email };
-        }
-      }
-      customerId = customers.data[0].id;
-    }
-  } catch (err: any) {
-    console.error("[rwstripe] Stripe lookup failed:", err.message);
-  }
-
-  return { restricted: true, hasAccess: false, productIds, email };
+function parseRequiredPlanSlugsFromUrl(url: URL): PaidPlanSlug[] {
+	const allValues = url.searchParams.getAll("requiredPlanSlugs");
+	if (allValues.length === 0) {
+		const single = url.searchParams.get("requiredPlanSlugs");
+		return single ? single.split(",").map((value) => value.trim()).filter(isPaidPlanSlug) : [];
+	}
+	return allValues.map((value) => value.trim()).filter(isPaidPlanSlug);
 }
 
-// Collect product IDs from both content restrictions and taxonomy restrictions
-// (mirrors WP: post meta + category meta + tag meta)
-async function getRestrictedProductIds(ctx: any, collectionSlug: string, contentId: string): Promise<string[]> {
-  const productIds: string[] = [];
+function readAccessInput(ctx: any) {
+	const url = new URL(ctx.request.url);
+	const body = isRecord(ctx.input) ? ctx.input : {};
+	return {
+		contentId:
+			typeof body.contentId === "string" ? body.contentId : (url.searchParams.get("contentId") ?? "").trim(),
+		collectionSlug:
+			typeof body.collectionSlug === "string"
+				? body.collectionSlug
+				: (url.searchParams.get("collectionSlug") || url.searchParams.get("collection") || "").trim(),
+		slug:
+			typeof body.slug === "string"
+				? body.slug
+				: (url.searchParams.get("slug") || null),
+		requiredPlanSlugs:
+			Array.isArray(body.requiredPlanSlugs)
+				? parsePaidPlanSlugs(body.requiredPlanSlugs)
+				: parseRequiredPlanSlugsFromUrl(url),
+	};
+}
 
-  // Direct content restriction
-  const restriction = await ctx.storage.restrictions.get(`${collectionSlug}:${contentId}`);
-  if (restriction) {
-    const ids = restriction.data?.productIds || restriction.productIds || [];
-    productIds.push(...ids);
-  }
+function normalizeRestrictionRecord(record: unknown): ContentRestrictionRecord | null {
+	const data = unwrapStoredRecord<ContentRestrictionRecord>(record);
+	if (!data || typeof data.contentId !== "string" || typeof data.collectionSlug !== "string") {
+		return null;
+	}
 
-  // Taxonomy restrictions — check all taxonomy terms assigned to this content
-  // In emdash, content-taxonomy relationships are queried via content API
-  // For now, we check all taxonomy restrictions and see if the content has matching terms
-  // (This would be more efficient with a content→terms lookup, but works for POC)
-  const taxResult = await ctx.storage.taxonomyRestrictions.query({});
-  if (taxResult.items.length > 0) {
-    // We'd need content API access to check which terms this content has
-    // For POC, taxonomy restrictions are checked at the Astro template level
-    // since we need to query the content's terms from the CMS
-  }
+	return {
+		contentId: data.contentId,
+		collectionSlug: data.collectionSlug,
+		slug: typeof data.slug === "string" ? data.slug : null,
+		title: typeof data.title === "string" ? data.title : null,
+		requiredPlanSlugs: parsePaidPlanSlugs(data.requiredPlanSlugs),
+		productIds: normalizeStringArray(data.productIds),
+		source: data.source === "manual" ? "manual" : "manual",
+		createdAt: typeof data.createdAt === "string" ? data.createdAt : new Date().toISOString(),
+		updatedAt: typeof data.updatedAt === "string" ? data.updatedAt : data.createdAt,
+	};
+}
 
-  return [...new Set(productIds)];
+async function getRestrictionRecords(
+	ctx: any,
+	collectionSlug: string,
+	contentId: string,
+	slug: string | null,
+): Promise<ContentRestrictionRecord[]> {
+	const records: ContentRestrictionRecord[] = [];
+	const primary = normalizeRestrictionRecord(await ctx.storage.restrictions.get(`${collectionSlug}:${contentId}`));
+	if (primary) {
+		records.push(primary);
+	}
+	if (slug && slug !== contentId) {
+		const legacy = normalizeRestrictionRecord(await ctx.storage.restrictions.get(`${collectionSlug}:${slug}`));
+		if (legacy) {
+			records.push(legacy);
+		}
+	}
+	return records;
+}
+
+export async function accessHandler(ctx: any): Promise<AccessDecision | { ok: false; error: string }> {
+	const { contentId, collectionSlug, slug, requiredPlanSlugs: callerRequiredPlanSlugs } = readAccessInput(ctx);
+	if (!contentId || !collectionSlug) {
+		return { ok: false, error: "contentId and collectionSlug are required." };
+	}
+
+	const restrictionRecords = await getRestrictionRecords(ctx, collectionSlug, contentId, slug);
+	const restrictionPlanSlugs = restrictionRecords.flatMap((record) => record.requiredPlanSlugs || []);
+	const restrictionProductIds = restrictionRecords.flatMap((record) => record.productIds || []);
+	const requiredPlanSlugs = uniqueStrings([...restrictionPlanSlugs, ...callerRequiredPlanSlugs]).filter(isPaidPlanSlug);
+	const settings = await loadSettings(ctx);
+	const requiredProductIds = uniqueStrings([
+		...restrictionProductIds,
+		...resolveRequiredProductIds(settings.planMappings, requiredPlanSlugs),
+	]);
+	const restricted = requiredPlanSlugs.length > 0 || requiredProductIds.length > 0;
+	const email = await getSessionEmail(ctx);
+	const authenticated = Boolean(email);
+
+	if (!restricted) {
+		return {
+			restricted: false,
+			authenticated,
+			hasAccess: true,
+			email,
+			requiredPlanSlugs,
+			requiredProductIds,
+		};
+	}
+
+	if (!authenticated || !email) {
+		return {
+			restricted: true,
+			authenticated: false,
+			hasAccess: false,
+			email: null,
+			requiredPlanSlugs,
+			requiredProductIds,
+		};
+	}
+
+	if (!settings.stripeSecretKey) {
+		return {
+			restricted: true,
+			authenticated: true,
+			hasAccess: false,
+			email,
+			requiredPlanSlugs,
+			requiredProductIds,
+			error: "Stripe is not configured yet.",
+		};
+	}
+
+	if (requiredPlanSlugs.length > 0 && requiredProductIds.length === 0) {
+		return {
+			restricted: true,
+			authenticated: true,
+			hasAccess: false,
+			email,
+			requiredPlanSlugs,
+			requiredProductIds,
+			error: "Required plans are not mapped to Stripe products yet.",
+		};
+	}
+
+	const stripe = new StripeClient(settings.stripeSecretKey, ctx.http.fetch);
+	const localCustomer = await getCustomerRecordByEmail(ctx, email);
+	if (localCustomer) {
+		try {
+			if (await stripe.customerHasProduct(localCustomer.stripeCustomerId, requiredProductIds)) {
+				return {
+					restricted: true,
+					authenticated: true,
+					hasAccess: true,
+					email,
+					requiredPlanSlugs,
+					requiredProductIds,
+				};
+			}
+		} catch (error) {
+			ctx.log.warn("Failed to verify cached Stripe customer access", error);
+		}
+	}
+
+	try {
+		const stripeCustomers = await stripe.getCustomersByEmail(email);
+		for (const stripeCustomer of stripeCustomers.data) {
+			if (await stripe.customerHasProduct(stripeCustomer.id, requiredProductIds)) {
+				await upsertCustomerRecord(ctx, email, stripeCustomer.id);
+				return {
+					restricted: true,
+					authenticated: true,
+					hasAccess: true,
+					email,
+					requiredPlanSlugs,
+					requiredProductIds,
+				};
+			}
+		}
+	} catch (error) {
+		ctx.log.error("Failed to verify Stripe access", error);
+		return {
+			restricted: true,
+			authenticated: true,
+			hasAccess: false,
+			email,
+			requiredPlanSlugs,
+			requiredProductIds,
+			error: "Unable to verify Stripe access right now.",
+		};
+	}
+
+	return {
+		restricted: true,
+		authenticated: true,
+		hasAccess: false,
+		email,
+		requiredPlanSlugs,
+		requiredProductIds,
+	};
 }

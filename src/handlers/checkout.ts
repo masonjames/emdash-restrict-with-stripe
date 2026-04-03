@@ -1,77 +1,63 @@
-// POST checkout — public, creates Stripe Checkout session
-// Creates a Stripe customer + access token. Token is passed through
-// the Stripe redirect so the browser can prove payment on return.
+import { findOrCreateCustomerRecord } from "../customers.js";
+import { isBillingInterval, isPaidPlanSlug, PLAN_BY_SLUG } from "../plans.js";
 import { StripeClient } from "../stripe.js";
-
-function generateToken(): string {
-  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-  let token = "rwst_";
-  for (let i = 0; i < 32; i++) token += chars[Math.floor(Math.random() * chars.length)];
-  return token;
-}
+import { isRecord, normalizeEmail, sanitizeRedirectPath } from "../utils.js";
+import { createSession, getSessionRecord } from "./auth.js";
+import { loadSettings } from "./settings.js";
 
 export async function checkoutHandler(ctx: any) {
-  const body = ctx.input || {};
-  const { price_id, redirect_url, email } = body;
+	const body = isRecord(ctx.input) ? ctx.input : {};
+	const planSlug = body.planSlug;
+	const billingInterval = body.billingInterval;
+	const email = normalizeEmail(body.email);
+	const redirectPath = sanitizeRedirectPath(body.redirectUrl, "/");
 
-  if (!price_id) return { error: "Please select a product." };
-  if (!redirect_url) return { error: "redirect_url is required." };
-  if (!email) return { error: "Email is required." };
+	if (!isPaidPlanSlug(planSlug)) {
+		return { ok: false, error: "A paid subscription option is required." };
+	}
+	if (!isBillingInterval(billingInterval)) {
+		return { ok: false, error: "A valid billing interval is required." };
+	}
+	if (!email) {
+		return { ok: false, error: "A valid email address is required." };
+	}
 
-  const secretKey = await ctx.kv.get("stripe_secret_key");
-  if (!secretKey) return { error: "Stripe not configured" };
+	const settings = await loadSettings(ctx);
+	if (!settings.stripeSecretKey) {
+		return { ok: false, error: "Stripe is not configured yet." };
+	}
 
-  const stripe = new StripeClient(secretKey, ctx.http.fetch);
+	const productId = settings.planMappings[planSlug];
+	if (!productId) {
+		return {
+			ok: false,
+			error: `${PLAN_BY_SLUG[planSlug].name} is not mapped to a Stripe product yet.`,
+		};
+	}
 
-  // Check if we already have a customer record for this email
-  let customerId: string | null = null;
-  let accessToken: string | null = null;
+	const stripe = new StripeClient(settings.stripeSecretKey, ctx.http.fetch);
+	const price = await stripe.findRecurringPriceForProduct(productId, billingInterval);
+	if (!price) {
+		return {
+			ok: false,
+			error: `No active ${billingInterval} price was found for ${PLAN_BY_SLUG[planSlug].name}.`,
+		};
+	}
 
-  // Look up by email in our customers storage
-  const existingCustomers = await ctx.storage.customers.query({ where: {} });
-  const existing = (existingCustomers.items || []).find(
-    (c: any) => (c.data?.email || c.email) === email
-  );
+	const customer = await findOrCreateCustomerRecord(ctx, stripe, email);
+	const existingSession = await getSessionRecord(ctx);
+	const session = existingSession?.email === email ? existingSession : await createSession(ctx, email);
 
-  if (existing) {
-    customerId = existing.data?.stripeCustomerId || existing.stripeCustomerId;
-    accessToken = existing.data?.accessToken || existing.accessToken;
-  }
+	const successUrl = new URL(ctx.url("/account/complete/"));
+	successUrl.searchParams.set("session", session.sessionToken);
+	successUrl.searchParams.set("redirect", redirectPath);
 
-  // Create Stripe customer if needed
-  if (!customerId) {
-    const customer = await stripe.createCustomer(email);
-    customerId = customer.id;
-  }
+	const checkoutSession = await stripe.createCheckoutSession({
+		priceId: price.id,
+		customerId: customer.stripeCustomerId,
+		successUrl: successUrl.toString(),
+		cancelUrl: ctx.url(redirectPath),
+	});
 
-  // Store/update customer record keyed by email
-  await ctx.storage.customers.put(email, {
-    email,
-    stripeCustomerId: customerId,
-    createdAt: new Date().toISOString(),
-  });
-
-  // Create a session immediately — Stripe redirect is proof of checkout.
-  // This lets us log them in the moment they return from Stripe.
-  const sessionToken = generateToken();
-  const sessionExpires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-  await ctx.storage.sessions.put(sessionToken, {
-    email,
-    sessionToken,
-    expiresAt: sessionExpires,
-    createdAt: new Date().toISOString(),
-  });
-
-  // Build success URL with session token (JS will set cookie on return)
-  const separator = redirect_url.includes("?") ? "&" : "?";
-  const successUrl = `${redirect_url}${separator}rwstripe_session=${encodeURIComponent(sessionToken)}`;
-
-  const session = await stripe.createCheckoutSession({
-    priceId: price_id,
-    customerId,
-    successUrl,
-    cancelUrl: redirect_url,
-  });
-
-  return { url: session.url };
+	return { ok: true, url: checkoutSession.url };
 }

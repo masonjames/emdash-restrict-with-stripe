@@ -1,70 +1,135 @@
-// Admin settings — Stripe keys, display preferences
-// Mirrors WP: rwstripe_stripe_access_token, rwstripe_show_excerpts, etc.
-//
-// Route context shape (from emdash PluginRouteHandler):
-//   ctx.input   — parsed JSON body (for POST/PUT/PATCH)
-//   ctx.request — original Request object (body already consumed)
-//   ctx.kv      — plugin-scoped key-value store
+import type { PaidPlanSlug } from "../plans.js";
+import { PAID_PLAN_SLUGS, isPaidPlanSlug } from "../plans.js";
+import { DEFAULT_PLAN_MAPPINGS, type PlanMappings, type RestrictWithStripeSettings, type StripeEnvironment } from "../types.js";
+import { isRecord, uniqueStrings } from "../utils.js";
+
+export function maskSecretKey(secretKey: string | null | undefined): string {
+	if (!secretKey) {
+		return "";
+	}
+
+	return `sk_••••${secretKey.slice(-4)}`;
+}
+
+export function normalizeStripeEnvironment(value: unknown): StripeEnvironment {
+	if (value === "test" || value === "sandbox") {
+		return "test";
+	}
+
+	return "live";
+}
+
+export function normalizePlanMappings(value: unknown): PlanMappings | null {
+	if (value == null) {
+		return { ...DEFAULT_PLAN_MAPPINGS };
+	}
+
+	if (!isRecord(value)) {
+		return null;
+	}
+
+	const planMappings: PlanMappings = { ...DEFAULT_PLAN_MAPPINGS };
+	for (const [key, rawValue] of Object.entries(value)) {
+		if (!isPaidPlanSlug(key)) {
+			return null;
+		}
+		if (rawValue != null && typeof rawValue !== "string") {
+			return null;
+		}
+		planMappings[key] = typeof rawValue === "string" && rawValue.trim() ? rawValue.trim() : null;
+	}
+
+	return planMappings;
+}
+
+export function resolveRequiredProductIds(
+	planMappings: PlanMappings,
+	requiredPlanSlugs: PaidPlanSlug[],
+): string[] {
+	return uniqueStrings(requiredPlanSlugs.map((planSlug) => planMappings[planSlug]));
+}
+
+export async function loadSettings(ctx: any): Promise<RestrictWithStripeSettings> {
+	const stripeSecretKey = await ctx.kv.get<string>("stripe_secret_key");
+	const stripePublishableKey = (await ctx.kv.get<string>("stripe_publishable_key")) || "";
+	const stripeAccountId = (await ctx.kv.get<string>("stripe_account_id")) || "";
+	const stripeEnvironment = normalizeStripeEnvironment(await ctx.kv.get("stripe_environment"));
+	const showExcerpts = (await ctx.kv.get("show_excerpts")) !== "false";
+	const planMappings = normalizePlanMappings(await ctx.kv.get("plan_mappings")) || {
+		...DEFAULT_PLAN_MAPPINGS,
+	};
+
+	return {
+		stripeSecretKey,
+		stripeSecretKeyMasked: maskSecretKey(stripeSecretKey),
+		stripePublishableKey,
+		stripeAccountId,
+		stripeEnvironment,
+		showExcerpts,
+		planMappings,
+		emailConfigured: Boolean(ctx.email),
+		isConfigured: Boolean(stripeSecretKey),
+	};
+}
 
 export async function settingsHandler(ctx: any) {
-  const method = ctx.request.method;
+	const method = ctx.request.method;
 
-  if (method === "GET") {
-    const secretKey = await ctx.kv.get("stripe_secret_key");
-    return {
-      stripeSecretKey: secretKey ? "sk_••••" + (secretKey as string).slice(-4) : "",
-      stripePublishableKey: (await ctx.kv.get("stripe_publishable_key")) || "",
-      stripeAccountId: (await ctx.kv.get("stripe_account_id")) || "",
-      stripeEnvironment: (await ctx.kv.get("stripe_environment")) || "live",
-      showExcerpts: (await ctx.kv.get("show_excerpts")) !== "false",
-      collectPassword: (await ctx.kv.get("collect_password")) === "true",
-      isConfigured: !!secretKey,
-    };
-  }
+	if (method === "GET") {
+		const { stripeSecretKey: _secretKey, ...settings } = await loadSettings(ctx);
+		return settings;
+	}
 
-  if (method === "POST") {
-    const body = ctx.input || {};
+	if (method === "POST") {
+		const body = isRecord(ctx.input) ? ctx.input : {};
 
-    // Handle disconnect — clear all Stripe keys
-    if (body.disconnect) {
-      await ctx.kv.delete("stripe_secret_key");
-      await ctx.kv.delete("stripe_publishable_key");
-      await ctx.kv.delete("stripe_account_id");
-      await ctx.kv.delete("stripe_environment");
-      return { ok: true, disconnected: true };
-    }
+		if (body.disconnect === true) {
+			await ctx.kv.delete("stripe_secret_key");
+			await ctx.kv.delete("stripe_publishable_key");
+			await ctx.kv.delete("stripe_account_id");
+			await ctx.kv.delete("stripe_environment");
+			return { ok: true, disconnected: true };
+		}
 
-    // Save Stripe keys (from Connect callback or manual entry)
-    // Skip masked values (returned by GET) so "Save Settings" doesn't clobber real keys
-    if (body.stripeSecretKey && !body.stripeSecretKey.startsWith("sk_••••")) {
-      await ctx.kv.set("stripe_secret_key", body.stripeSecretKey);
-    }
-    if (body.stripePublishableKey && !body.stripePublishableKey.startsWith("pk_••••")) {
-      await ctx.kv.set("stripe_publishable_key", body.stripePublishableKey);
-    }
-    if (body.stripeAccountId) {
-      await ctx.kv.set("stripe_account_id", body.stripeAccountId);
-    }
-    // Normalize environment: connect server sends "sandbox", we store "test"
-    if (body.stripeEnvironment !== undefined) {
-      const env = body.stripeEnvironment === "sandbox" ? "test" : body.stripeEnvironment;
-      await ctx.kv.set("stripe_environment", env);
-    } else if (body.stripeSecretKey && !body.stripeSecretKey.startsWith("sk_••••")) {
-      // Infer from key prefix when not explicitly provided
-      const env = body.stripeSecretKey.startsWith("sk_test_") ? "test" : "live";
-      await ctx.kv.set("stripe_environment", env);
-    }
+		if (typeof body.stripeSecretKey === "string" && !body.stripeSecretKey.startsWith("sk_••••")) {
+			await ctx.kv.set("stripe_secret_key", body.stripeSecretKey.trim());
+		}
+		if (
+			typeof body.stripePublishableKey === "string" &&
+			!body.stripePublishableKey.startsWith("pk_••••")
+		) {
+			await ctx.kv.set("stripe_publishable_key", body.stripePublishableKey.trim());
+		}
+		if (typeof body.stripeAccountId === "string") {
+			await ctx.kv.set("stripe_account_id", body.stripeAccountId.trim());
+		}
 
-    // Display settings — only save when explicitly provided
-    if (body.showExcerpts !== undefined) {
-      await ctx.kv.set("show_excerpts", String(body.showExcerpts));
-    }
-    if (body.collectPassword !== undefined) {
-      await ctx.kv.set("collect_password", String(body.collectPassword));
-    }
+		if (body.stripeEnvironment !== undefined) {
+			await ctx.kv.set("stripe_environment", normalizeStripeEnvironment(body.stripeEnvironment));
+		} else if (typeof body.stripeSecretKey === "string" && !body.stripeSecretKey.startsWith("sk_••••")) {
+			await ctx.kv.set(
+				"stripe_environment",
+				body.stripeSecretKey.startsWith("sk_test_") ? "test" : "live",
+			);
+		}
 
-    return { ok: true };
-  }
+		if (typeof body.showExcerpts === "boolean") {
+			await ctx.kv.set("show_excerpts", String(body.showExcerpts));
+		}
 
-  return { error: "Method not allowed" };
+		if (body.planMappings !== undefined) {
+			const normalizedMappings = normalizePlanMappings(body.planMappings);
+			if (!normalizedMappings) {
+				return {
+					ok: false,
+					error: `planMappings must be an object keyed by ${PAID_PLAN_SLUGS.join(", ")}.`,
+				};
+			}
+			await ctx.kv.set("plan_mappings", normalizedMappings);
+		}
+
+		return { ok: true };
+	}
+
+	return { ok: false, error: "Method not allowed." };
 }

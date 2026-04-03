@@ -6,7 +6,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./plugin": "./src/plugin.ts",
-    "./admin": "./src/admin.tsx"
+    "./admin": "./src/admin.tsx",
+    "./plans": "./src/plans.ts"
   },
   "peerDependencies": {
     "emdash": ">=0.1.0",

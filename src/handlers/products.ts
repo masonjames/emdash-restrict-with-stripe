@@ -1,11 +1,13 @@
-// GET products — admin only, returns all active Stripe products
 import { StripeClient } from "../stripe.js";
+import { loadSettings } from "./settings.js";
 
 export async function productsHandler(ctx: any) {
-  const secretKey = await ctx.kv.get("stripe_secret_key");
-  if (!secretKey) return { error: "Stripe not configured" };
+	const settings = await loadSettings(ctx);
+	if (!settings.stripeSecretKey) {
+		return { ok: false, error: "Stripe is not configured yet." };
+	}
 
-  const stripe = new StripeClient(secretKey, ctx.http.fetch);
-  const products = await stripe.getAllProducts();
-  return { products: products.data };
+	const stripe = new StripeClient(settings.stripeSecretKey, ctx.http.fetch);
+	const products = await stripe.getAllProducts();
+	return { ok: true, products: products.data };
 }

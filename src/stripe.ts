@@ -1,146 +1,185 @@
-// Fetch-based Stripe client — works in emdash sandboxed plugins (no Node SDK).
-
 type FetchFn = (url: string, init?: RequestInit) => Promise<Response>;
 
-export class StripeClient {
-  constructor(
-    private secretKey: string,
-    private fetchFn: FetchFn,
-  ) {}
-
-  private async request(path: string, method = "GET", body?: Record<string, string>) {
-    const res = await this.fetchFn(`https://api.stripe.com/v1${path}`, {
-      method,
-      headers: {
-        Authorization: `Bearer ${this.secretKey}`,
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: body ? new URLSearchParams(body).toString() : undefined,
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.error?.message || `Stripe error ${res.status}`);
-    }
-    return data;
-  }
-
-  // ─── Products & Prices ─────────────────────────────────────────
-
-  async getAllProducts(): Promise<{ data: StripeProduct[] }> {
-    return this.request("/products?active=true&limit=100");
-  }
-
-  async getProduct(id: string): Promise<StripeProduct> {
-    return this.request(`/products/${encodeURIComponent(id)}`);
-  }
-
-  async getPrice(id: string): Promise<StripePrice> {
-    return this.request(`/prices/${encodeURIComponent(id)}`);
-  }
-
-  // ─── Customers ─────────────────────────────────────────────────
-
-  async createCustomer(email: string): Promise<{ id: string }> {
-    return this.request("/customers", "POST", { email });
-  }
-
-  async updateCustomerEmail(customerId: string, email: string) {
-    return this.request(`/customers/${encodeURIComponent(customerId)}`, "POST", { email });
-  }
-
-  async getCustomersByEmail(email: string): Promise<{ data: Array<{ id: string }> }> {
-    return this.request(`/customers?email=${encodeURIComponent(email)}&limit=10`);
-  }
-
-  // ─── Checkout ──────────────────────────────────────────────────
-
-  async createCheckoutSession(params: {
-    priceId: string;
-    customerId: string;
-    successUrl: string;
-    cancelUrl: string;
-  }): Promise<{ url: string }> {
-    // Detect mode from price
-    const price = await this.getPrice(params.priceId);
-    const mode = price.type === "recurring" ? "subscription" : "payment";
-
-    return this.request("/checkout/sessions", "POST", {
-      "line_items[0][price]": params.priceId,
-      "line_items[0][quantity]": "1",
-      customer: params.customerId,
-      success_url: params.successUrl,
-      cancel_url: params.cancelUrl,
-      mode,
-    });
-  }
-
-  // ─── Customer Portal ───────────────────────────────────────────
-
-  async createPortalSession(customerId: string, returnUrl: string): Promise<{ url: string }> {
-    return this.request("/billing_portal/sessions", "POST", {
-      customer: customerId,
-      return_url: returnUrl,
-    });
-  }
-
-  // ─── Access Checks ─────────────────────────────────────────────
-
-  async customerHasProduct(customerId: string, productIds: string[]): Promise<boolean> {
-    if (!customerId || productIds.length === 0) return false;
-
-    // Check active/trialing subscriptions
-    const subs = await this.request(
-      `/subscriptions?customer=${encodeURIComponent(customerId)}&status=active&limit=100`,
-    );
-    for (const sub of subs.data || []) {
-      for (const item of sub.items?.data || []) {
-        if (productIds.includes(item.price?.product)) return true;
-      }
-    }
-
-    // Check trialing
-    const trialSubs = await this.request(
-      `/subscriptions?customer=${encodeURIComponent(customerId)}&status=trialing&limit=100`,
-    );
-    for (const sub of trialSubs.data || []) {
-      for (const item of sub.items?.data || []) {
-        if (productIds.includes(item.price?.product)) return true;
-      }
-    }
-
-    // Check paid invoices (one-time purchases, not subscription invoices)
-    const invoices = await this.request(
-      `/invoices?customer=${encodeURIComponent(customerId)}&status=paid&limit=100`,
-    );
-    for (const inv of invoices.data || []) {
-      if (inv.subscription) continue; // Skip subscription invoices
-      if (inv.metadata?.["rwstripe-ignore"]) continue;
-      for (const line of inv.lines?.data || []) {
-        if (productIds.includes(line.price?.product)) return true;
-      }
-    }
-
-    return false;
-  }
-}
-
-// ─── Types ───────────────────────────────────────────────────────
-
 export interface StripeProduct {
-  id: string;
-  name: string;
-  description: string | null;
-  default_price: string | null;
-  active: boolean;
-  images: string[];
+	id: string;
+	name: string;
+	description: string | null;
+	default_price: string | null;
+	active: boolean;
+	images: string[];
 }
 
 export interface StripePrice {
-  id: string;
-  product: string;
-  active: boolean;
-  currency: string;
-  unit_amount: number | null;
-  type: "one_time" | "recurring";
-  recurring: { interval: string; interval_count: number } | null;
+	id: string;
+	product: string;
+	active: boolean;
+	currency: string;
+	unit_amount: number | null;
+	type: "one_time" | "recurring";
+	recurring: { interval: string; interval_count: number } | null;
+}
+
+interface StripeSubscriptionList {
+	data?: Array<{
+		status?: string;
+		items?: {
+			data?: Array<{
+				price?: {
+					product?: string;
+				};
+			}>;
+		};
+	}>;
+}
+
+interface StripeInvoiceList {
+	data?: Array<{
+		subscription?: string | null;
+		metadata?: Record<string, string>;
+		lines?: {
+			data?: Array<{
+				price?: {
+					product?: string;
+				};
+			}>;
+		};
+	}>;
+}
+
+export class StripeClient {
+	constructor(
+		private readonly secretKey: string,
+		private readonly fetchFn: FetchFn,
+	) {}
+
+	private async request<T>(path: string, method = "GET", body?: Record<string, string | undefined>): Promise<T> {
+		const searchParams = new URLSearchParams();
+		if (body) {
+			for (const [key, value] of Object.entries(body)) {
+				if (typeof value === "string") {
+					searchParams.set(key, value);
+				}
+			}
+		}
+
+		const response = await this.fetchFn(`https://api.stripe.com/v1${path}`, {
+			method,
+			headers: {
+				Authorization: `Bearer ${this.secretKey}`,
+				"Content-Type": "application/x-www-form-urlencoded",
+			},
+			body: method === "GET" ? undefined : searchParams.toString(),
+		});
+
+		const data = (await response.json()) as T & { error?: { message?: string } };
+		if (!response.ok) {
+			throw new Error(data.error?.message || `Stripe error ${response.status}`);
+		}
+		return data;
+	}
+
+	async getAllProducts(): Promise<{ data: StripeProduct[] }> {
+		return this.request<{ data: StripeProduct[] }>("/products?active=true&limit=100");
+	}
+
+	async getPrice(id: string): Promise<StripePrice> {
+		return this.request<StripePrice>(`/prices/${encodeURIComponent(id)}`);
+	}
+
+	async listPricesForProduct(productId: string): Promise<{ data: StripePrice[] }> {
+		return this.request<{ data: StripePrice[] }>(
+			`/prices?product=${encodeURIComponent(productId)}&active=true&limit=100`,
+		);
+	}
+
+	async findRecurringPriceForProduct(productId: string, interval: "monthly" | "yearly"): Promise<StripePrice | null> {
+		const prices = await this.listPricesForProduct(productId);
+		const expectedInterval = interval === "monthly" ? "month" : "year";
+
+		return (
+			prices.data.find(
+				(price) =>
+					price.active &&
+					price.type === "recurring" &&
+					price.recurring?.interval === expectedInterval &&
+					price.recurring.interval_count === 1,
+			) ?? null
+		);
+	}
+
+	async createCustomer(email: string): Promise<{ id: string }> {
+		return this.request<{ id: string }>("/customers", "POST", { email });
+	}
+
+	async updateCustomerEmail(customerId: string, email: string): Promise<void> {
+		await this.request(`/customers/${encodeURIComponent(customerId)}`, "POST", { email });
+	}
+
+	async getCustomersByEmail(email: string): Promise<{ data: Array<{ id: string }> }> {
+		return this.request<{ data: Array<{ id: string }> }>(
+			`/customers?email=${encodeURIComponent(email)}&limit=10`,
+		);
+	}
+
+	async createCheckoutSession(params: {
+		priceId: string;
+		customerId: string;
+		successUrl: string;
+		cancelUrl: string;
+	}): Promise<{ url: string }> {
+		const price = await this.getPrice(params.priceId);
+		const mode = price.type === "recurring" ? "subscription" : "payment";
+
+		return this.request<{ url: string }>("/checkout/sessions", "POST", {
+			"line_items[0][price]": params.priceId,
+			"line_items[0][quantity]": "1",
+			customer: params.customerId,
+			success_url: params.successUrl,
+			cancel_url: params.cancelUrl,
+			mode,
+		});
+	}
+
+	async createPortalSession(customerId: string, returnUrl: string): Promise<{ url: string }> {
+		return this.request<{ url: string }>("/billing_portal/sessions", "POST", {
+			customer: customerId,
+			return_url: returnUrl,
+		});
+	}
+
+	async customerHasProduct(customerId: string, productIds: string[]): Promise<boolean> {
+		if (!customerId || productIds.length === 0) {
+			return false;
+		}
+
+		const subscriptions = await this.request<StripeSubscriptionList>(
+			`/subscriptions?customer=${encodeURIComponent(customerId)}&status=all&limit=100`,
+		);
+		for (const subscription of subscriptions.data || []) {
+			if (subscription.status !== "active" && subscription.status !== "trialing") {
+				continue;
+			}
+			for (const item of subscription.items?.data || []) {
+				if (productIds.includes(item.price?.product || "")) {
+					return true;
+				}
+			}
+		}
+
+		const invoices = await this.request<StripeInvoiceList>(
+			`/invoices?customer=${encodeURIComponent(customerId)}&status=paid&limit=100`,
+		);
+		for (const invoice of invoices.data || []) {
+			if (invoice.subscription || invoice.metadata?.rwstripeIgnore) {
+				continue;
+			}
+			for (const line of invoice.lines?.data || []) {
+				if (productIds.includes(line.price?.product || "")) {
+					return true;
+				}
+			}
+		}
+
+		return false;
+	}
 }

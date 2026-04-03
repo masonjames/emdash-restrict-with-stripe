@@ -1,22 +1,38 @@
-// GET customer_portal_url — authenticated, returns Stripe Customer Portal URL
+import { getCustomerRecordByEmail, upsertCustomerRecord } from "../customers.js";
 import { StripeClient } from "../stripe.js";
+import { sanitizeRedirectPath } from "../utils.js";
+import { getSessionEmail } from "./auth.js";
+import { loadSettings } from "./settings.js";
 
 export async function portalHandler(ctx: any) {
-  const userId = ctx.user?.id;
-  if (!userId) return { error: "Not authenticated" };
+	const email = await getSessionEmail(ctx);
+	if (!email) {
+		return { ok: false, code: "NOT_AUTHENTICATED", error: "Sign in to manage your subscription." };
+	}
 
-  const secretKey = await ctx.kv.get("stripe_secret_key");
-  if (!secretKey) return { error: "Stripe not configured" };
+	const settings = await loadSettings(ctx);
+	if (!settings.stripeSecretKey) {
+		return { ok: false, code: "STRIPE_NOT_CONFIGURED", error: "Stripe is not configured yet." };
+	}
 
-  const customer = await ctx.storage.customers.get(userId);
-  if (!customer) return { error: "No customer found for this user." };
+	const stripe = new StripeClient(settings.stripeSecretKey, ctx.http.fetch);
+	let customer = await getCustomerRecordByEmail(ctx, email);
+	if (!customer) {
+		const stripeCustomers = await stripe.getCustomersByEmail(email);
+		const stripeCustomerId = stripeCustomers.data[0]?.id;
+		if (!stripeCustomerId) {
+			return { ok: false, code: "NO_CUSTOMER", error: "No Stripe customer was found for this email address." };
+		}
+		customer = await upsertCustomerRecord(ctx, email, stripeCustomerId);
+	}
 
-  const customerId = customer.data?.stripeCustomerId || customer.stripeCustomerId;
-  const url = new URL(ctx.request.url);
-  const returnUrl = url.searchParams.get("return_url") || "/";
-
-  const stripe = new StripeClient(secretKey, ctx.http.fetch);
-  const session = await stripe.createPortalSession(customerId, returnUrl);
-
-  return { url: session.url };
+	try {
+		const requestUrl = new URL(ctx.request.url);
+		const returnUrl = ctx.url(sanitizeRedirectPath(requestUrl.searchParams.get("return_url"), "/account/"));
+		const session = await stripe.createPortalSession(customer.stripeCustomerId, returnUrl);
+		return { ok: true, url: session.url };
+	} catch (error) {
+		ctx.log.error("Failed to create Stripe portal session", error);
+		return { ok: false, code: "STRIPE_UNAVAILABLE", error: "Unable to open the Stripe customer portal right now." };
+	}
 }

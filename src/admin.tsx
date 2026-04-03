@@ -1,543 +1,532 @@
-import React, { useState, useEffect, useCallback, useRef } from "react";
-import { createPortal } from "react-dom";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+
+import { CANONICAL_PLANS, type PaidPlanSlug } from "./plans.js";
 
 const API = "/_emdash/api/plugins/restrict-with-stripe";
-const HEADERS: Record<string, string> = { "X-EmDash-Request": "1", "Content-Type": "application/json" };
+const HEADERS: Record<string, string> = {
+	"Content-Type": "application/json",
+	"X-EmDash-Request": "1",
+};
+const PAID_PLANS = CANONICAL_PLANS.filter((plan): plan is (typeof CANONICAL_PLANS)[number] & { slug: PaidPlanSlug } =>
+	plan.tier === "paid",
+);
 
-async function api(path: string, opts?: RequestInit) {
-  const res = await fetch(`${API}${path}`, { ...opts, headers: { ...HEADERS, ...opts?.headers } });
-  const json = await res.json();
-  return json.data || json;
+type Product = {
+	id: string;
+	name: string;
+	description?: string | null;
+};
+
+type PlanMappings = Record<PaidPlanSlug, string | null>;
+
+type SettingsState = {
+	stripeSecretKeyMasked: string;
+	stripePublishableKey: string;
+	stripeAccountId: string;
+	stripeEnvironment: "live" | "test";
+	showExcerpts: boolean;
+	planMappings: PlanMappings;
+	emailConfigured: boolean;
+	isConfigured: boolean;
+};
+
+type RestrictionRecord = {
+	id: string;
+	data: {
+		contentId: string;
+		collectionSlug: string;
+		slug?: string | null;
+		title?: string | null;
+		requiredPlanSlugs?: PaidPlanSlug[];
+		productIds?: string[];
+	};
+};
+
+async function api<T>(path: string, options?: RequestInit): Promise<T> {
+	const response = await fetch(`${API}${path}`, {
+		...options,
+		headers: {
+			...HEADERS,
+			...(options?.headers || {}),
+		},
+	});
+	const payload = await response.json().catch(() => ({}));
+	if (!response.ok) {
+		throw new Error(payload?.error?.message || "Request failed.");
+	}
+	return (payload?.data ?? payload) as T;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Settings Page
-// ═══════════════════════════════════════════════════════════════════
+function buildEmptyPlanMappings(): PlanMappings {
+	return {
+		"default-product": null,
+		"content-personall-ai": null,
+	};
+}
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+	return (
+		<section style={{ marginBottom: 28 }}>
+			<h3 style={{ fontSize: 15, fontWeight: 600, marginBottom: 10 }}>{title}</h3>
+			{children}
+		</section>
+	);
+}
+
+function FieldLabel({ children }: { children: React.ReactNode }) {
+	return <span style={{ display: "block", fontSize: 12, fontWeight: 600, marginBottom: 6 }}>{children}</span>;
+}
+
 function SettingsPage() {
-  const [settings, setSettings] = useState<any>(null);
-  const [saving, setSaving] = useState(false);
-  const [msg, setMsg] = useState("");
-  const [testMode, setTestMode] = useState(false);
+	const [settings, setSettings] = useState<SettingsState | null>(null);
+	const [products, setProducts] = useState<Product[]>([]);
+	const [message, setMessage] = useState("");
+	const [saving, setSaving] = useState(false);
+	const [testMode, setTestMode] = useState(false);
+	const CONNECT_URL = "https://connect.restrictwithstripe.com";
 
-  const CONNECT_URL = "https://connect.restrictwithstripe.com";
+	const load = useCallback(async () => {
+		const loadedSettings = await api<SettingsState>("/admin/settings");
+		setSettings(loadedSettings);
+		try {
+			const productResult = await api<{ ok?: boolean; products?: Product[] }>("/admin/products");
+			setProducts(productResult.products || []);
+		} catch {
+			setProducts([]);
+		}
+	}, []);
 
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const cleanUrl = window.location.pathname + "?page=rwstripe";
+	useEffect(() => {
+		const params = new URLSearchParams(window.location.search);
+		const cleanUrl = window.location.pathname;
+		if (params.get("pmpro_stripe_connected") === "true") {
+			const connectData = {
+				stripeSecretKey: params.get("pmpro_stripe_access_token") || "",
+				stripePublishableKey: params.get("pmpro_stripe_publishable_key") || "",
+				stripeAccountId: params.get("pmpro_stripe_user_id") || "",
+				stripeEnvironment: params.get("pmpro_stripe_connected_environment") || "live",
+			};
+			api("/admin/settings", { method: "POST", body: JSON.stringify(connectData) })
+				.then(() => load())
+				.then(() => setMessage("Connected to Stripe."))
+				.catch((error: Error) => setMessage(error.message));
+			window.history.replaceState({}, "", cleanUrl);
+			return;
+		}
 
-    if (params.get("pmpro_stripe_connected") === "true") {
-      const connectData = {
-        stripeSecretKey: params.get("pmpro_stripe_access_token") || "",
-        stripePublishableKey: params.get("pmpro_stripe_publishable_key") || "",
-        stripeAccountId: params.get("pmpro_stripe_user_id") || "",
-        stripeEnvironment: params.get("pmpro_stripe_connected_environment") || "live",
-      };
-      api("/admin/settings", { method: "POST", body: JSON.stringify(connectData) })
-        .then(() => api("/admin/settings"))
-        .then(s => { setSettings(s); setMsg("Connected to Stripe!"); })
-        .catch(() => setMsg("Error saving Stripe credentials."));
-      window.history.replaceState({}, "", cleanUrl);
-    } else if (params.get("pmpro_stripe_connected") === "false") {
-      setMsg(params.get("error_message") || "Failed to connect to Stripe.");
-      window.history.replaceState({}, "", cleanUrl);
-      api("/admin/settings").then(setSettings);
-    } else if (params.get("pmpro_stripe_disconnected") === "true") {
-      setMsg("Disconnected from Stripe.");
-      api("/admin/settings").then(setSettings);
-      window.history.replaceState({}, "", cleanUrl);
-    } else {
-      api("/admin/settings").then(setSettings);
-    }
-  }, []);
+		if (params.get("pmpro_stripe_connected") === "false") {
+			setMessage(params.get("error_message") || "Failed to connect Stripe.");
+			window.history.replaceState({}, "", cleanUrl);
+		}
 
-  function buildConnectUrl() {
-    const returnUrl = window.location.origin + window.location.pathname + "?page=rwstripe";
-    const env = testMode ? "sandbox" : "live";
-    return `${CONNECT_URL}?action=authorize&gateway_environment=${env}&return_url=${encodeURIComponent(returnUrl)}`;
-  }
+		if (params.get("pmpro_stripe_disconnected") === "true") {
+			setMessage("Disconnected from Stripe.");
+			window.history.replaceState({}, "", cleanUrl);
+		}
 
-  async function disconnect() {
-    if (!confirm("Disconnect from Stripe?")) return;
-    setSaving(true);
-    const returnUrl = window.location.origin + window.location.pathname + "?page=rwstripe";
-    const env = settings.stripeEnvironment === "test" ? "sandbox" : "live";
-    const disconnectUrl = `${CONNECT_URL}?action=disconnect&gateway_environment=${env}&stripe_user_id=${settings.stripeAccountId || ""}&return_url=${encodeURIComponent(returnUrl)}`;
-    await api("/admin/settings", { method: "POST", body: JSON.stringify({ disconnect: true }) });
-    window.location.href = disconnectUrl;
-  }
+		load().catch((error: Error) => setMessage(error.message));
+	}, [load]);
 
-  const save = async () => {
-    setSaving(true); setMsg("");
-    try {
-      await api("/admin/settings", {
-        method: "POST",
-        body: JSON.stringify({ showExcerpts: settings.showExcerpts, collectPassword: settings.collectPassword }),
-      });
-      const updated = await api("/admin/settings");
-      setSettings(updated);
-      setMsg("Settings saved.");
-    } catch { setMsg("Error saving."); }
-    setSaving(false);
-  };
+	function buildConnectUrl() {
+		const returnUrl = window.location.origin + window.location.pathname;
+		const env = testMode ? "sandbox" : "live";
+		return `${CONNECT_URL}?action=authorize&gateway_environment=${env}&return_url=${encodeURIComponent(returnUrl)}`;
+	}
 
-  if (!settings) return <p>Loading...</p>;
+	async function disconnect() {
+		if (!settings || !window.confirm("Disconnect from Stripe?")) {
+			return;
+		}
+		setSaving(true);
+		try {
+			await api("/admin/settings", { method: "POST", body: JSON.stringify({ disconnect: true }) });
+			const env = settings.stripeEnvironment === "test" ? "sandbox" : "live";
+			const returnUrl = window.location.origin + window.location.pathname;
+			window.location.href = `${CONNECT_URL}?action=disconnect&gateway_environment=${env}&stripe_user_id=${settings.stripeAccountId || ""}&return_url=${encodeURIComponent(returnUrl)}`;
+		} catch (error) {
+			setMessage(error instanceof Error ? error.message : "Unable to disconnect Stripe.");
+			setSaving(false);
+		}
+	}
 
-  return (
-    <div style={{ maxWidth: 640, padding: 16 }}>
-      <h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 16 }}>Restrict With Stripe</h2>
+	async function save() {
+		if (!settings) {
+			return;
+		}
+		setSaving(true);
+		setMessage("");
+		try {
+			await api("/admin/settings", {
+				method: "POST",
+				body: JSON.stringify({
+					showExcerpts: settings.showExcerpts,
+					planMappings: settings.planMappings,
+				}),
+			});
+			await load();
+			setMessage("Settings saved.");
+		} catch (error) {
+			setMessage(error instanceof Error ? error.message : "Unable to save settings.");
+		} finally {
+			setSaving(false);
+		}
+	}
 
-      <Section title={settings.isConfigured
-        ? `1. Connect to Stripe (Connected${settings.stripeEnvironment === "test" ? " in Test Mode" : ""})`
-        : "1. Connect to Stripe"}>
-        {settings.isConfigured ? (
-          <>
-            <p style={{ fontSize: 14, color: "#374151", marginBottom: 8 }}>
-              Connected to account: <strong>{settings.stripeAccountId || "—"}</strong>
-            </p>
-            <p style={{ fontSize: 13, color: "#6b7280", marginBottom: 12 }}>
-              <a href={`https://dashboard.stripe.com/${settings.stripeEnvironment === "test" ? "test/" : ""}dashboard`}
-                target="_blank" rel="noopener" style={{ color: "#635bff" }}>
-                Visit your Stripe account dashboard
-              </a>
-            </p>
-            <button onClick={disconnect} disabled={saving}
-              style={{ ...btnStyle, background: "#6b7280", fontSize: 13, padding: "6px 14px" }}>
-              Disconnect From Stripe
-            </button>
-          </>
-        ) : (
-          <>
-            <div style={{ marginBottom: 12 }}>
-              <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 14, cursor: "pointer" }}>
-                <input type="checkbox" checked={testMode} onChange={e => setTestMode(e.target.checked)} />
-                Connect in Test Mode
-              </label>
-            </div>
-            <a href={buildConnectUrl()} style={{
-              display: "inline-block", padding: "10px 20px", background: "#635bff", color: "white",
-              textDecoration: "none", borderRadius: 6, fontSize: 14, fontWeight: 500, marginBottom: 12,
-            }}>
-              Connect to Stripe{testMode ? " (Test Mode)" : ""}
-            </a>
-          </>
-        )}
-      </Section>
+	if (!settings) {
+		return <p>Loading…</p>;
+	}
 
-      <Section title="2. Create Products in Stripe">
-        <p style={{ fontSize: 14, color: "#6b7280" }}>
-          Create products and prices in your{" "}
-          <a href="https://dashboard.stripe.com/products" target="_blank" rel="noopener" style={{ color: "#635bff" }}>
-            Stripe Dashboard</a>. Each product needs at least one price.
-        </p>
-      </Section>
+	return (
+		<div style={{ maxWidth: 760, padding: 16 }}>
+			<h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 16 }}>Restrict With Stripe</h2>
 
-      <Section title="3. Restrict Content">
-        <p style={{ fontSize: 14, color: "#6b7280" }}>
-          Edit any post or page and click the <strong>Restrict</strong> button in the toolbar
-          to choose which Stripe products are required for access.
-        </p>
-      </Section>
+			<Section title="1. Connect to Stripe">
+				{settings.isConfigured ? (
+					<>
+						<p style={helpText}>Connected to account <strong>{settings.stripeAccountId || "—"}</strong> ({settings.stripeEnvironment}).</p>
+						<div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+							<a
+								href={`https://dashboard.stripe.com/${settings.stripeEnvironment === "test" ? "test/" : ""}products`}
+								target="_blank"
+								rel="noopener"
+								style={linkStyle}
+							>
+								Open Stripe dashboard
+							</a>
+							<button type="button" onClick={disconnect} disabled={saving} style={{ ...buttonStyle, background: "#4b5563" }}>
+								Disconnect
+							</button>
+						</div>
+					</>
+				) : (
+					<>
+						<label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+							<input type="checkbox" checked={testMode} onChange={(event) => setTestMode(event.target.checked)} />
+							Connect in test mode
+						</label>
+						<a href={buildConnectUrl()} style={buttonLinkStyle}>
+							Connect to Stripe{testMode ? " (test)" : ""}
+						</a>
+					</>
+				)}
+			</Section>
 
-      <Section title="4. Display Settings">
-        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 14, marginBottom: 8 }}>
-          <input type="checkbox" checked={settings.showExcerpts}
-            onChange={e => setSettings({ ...settings, showExcerpts: e.target.checked })} />
-          Show excerpts on restricted content
-        </label>
-        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 14 }}>
-          <input type="checkbox" checked={settings.collectPassword}
-            onChange={e => setSettings({ ...settings, collectPassword: e.target.checked })} />
-          Collect password at registration
-        </label>
-        <button onClick={save} disabled={saving} style={{ ...btnStyle, marginTop: 12 }}>
-          {saving ? "Saving..." : "Save Settings"}
-        </button>
-        {msg && <p style={{ marginTop: 8, fontSize: 14, color: msg.includes("Error") ? "#dc2626" : "#059669" }}>{msg}</p>}
-      </Section>
-    </div>
-  );
+			<Section title="2. Membership plan mapping">
+				<p style={helpText}>Map the Ghost parity plans to active Stripe products. Checkout and access checks use these mappings.</p>
+				<div style={{ display: "grid", gap: 14 }}>
+					{PAID_PLANS.map((plan) => (
+						<label key={plan.slug}>
+							<FieldLabel>{plan.name}</FieldLabel>
+							<select
+								value={settings.planMappings[plan.slug] || ""}
+								onChange={(event) =>
+									setSettings({
+										...settings,
+										planMappings: {
+											...settings.planMappings,
+											[plan.slug]: event.target.value || null,
+										},
+									})
+								}
+								style={inputStyle}
+							>
+								<option value="">Choose a Stripe product</option>
+								{products.map((product) => (
+									<option key={product.id} value={product.id}>
+										{product.name}
+									</option>
+								))}
+							</select>
+							<p style={captionText}>{plan.monthlyLabel} · {plan.yearlyLabel}</p>
+						</label>
+					))}
+				</div>
+			</Section>
+
+			<Section title="3. Delivery & gating">
+				<label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+					<input
+						type="checkbox"
+						checked={settings.showExcerpts}
+						onChange={(event) => setSettings({ ...settings, showExcerpts: event.target.checked })}
+					/>
+					Show excerpts on locked content
+				</label>
+				<p style={{ ...helpText, marginTop: 12 }}>
+					Email provider: <strong>{settings.emailConfigured ? "configured" : "missing"}</strong>
+				</p>
+			</Section>
+
+			<button type="button" onClick={save} disabled={saving} style={buttonStyle}>
+				{saving ? "Saving…" : "Save settings"}
+			</button>
+			{message && <p style={{ ...helpText, color: message.toLowerCase().includes("error") ? "#b91c1c" : "#166534", marginTop: 12 }}>{message}</p>}
+		</div>
+	);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Restrictions Page
-// ═══════════════════════════════════════════════════════════════════
 function RestrictionsPage() {
-  const [restrictions, setRestrictions] = useState<any[]>([]);
-  const [products, setProducts] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
+	const [restrictions, setRestrictions] = useState<RestrictionRecord[]>([]);
+	const [loading, setLoading] = useState(true);
+	const [saving, setSaving] = useState(false);
+	const [message, setMessage] = useState("");
+	const [draft, setDraft] = useState({
+		collectionSlug: "posts",
+		contentId: "",
+		slug: "",
+		title: "",
+		requiredPlanSlugs: [] as PaidPlanSlug[],
+	});
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    const [r, p] = await Promise.all([
-      api("/admin/restrictions"),
-      api("/admin/products").catch(() => ({ products: [] })),
-    ]);
-    setRestrictions(r.items || []);
-    setProducts(p.products || []);
-    setLoading(false);
-  }, []);
+	const load = useCallback(async () => {
+		setLoading(true);
+		try {
+			const result = await api<{ items: RestrictionRecord[] }>("/admin/restrictions");
+			setRestrictions(result.items || []);
+		} finally {
+			setLoading(false);
+		}
+	}, []);
 
-  useEffect(() => { load(); }, [load]);
+	useEffect(() => {
+		load().catch((error: Error) => setMessage(error.message));
+	}, [load]);
 
-  const remove = async (item: any) => {
-    const d = item.data || item;
-    await api("/admin/restrictions", {
-      method: "DELETE",
-      body: JSON.stringify({ contentId: d.contentId, collectionSlug: d.collectionSlug }),
-    });
-    load();
-  };
+	const planLabels = useMemo(
+		() =>
+			Object.fromEntries(PAID_PLANS.map((plan) => [plan.slug, plan.name])) as Record<PaidPlanSlug, string>,
+		[],
+	);
 
-  if (loading) return <p>Loading...</p>;
+	async function saveRestriction() {
+		if (!draft.collectionSlug || !draft.contentId) {
+			setMessage("Collection slug and content ID are required.");
+			return;
+		}
 
-  return (
-    <div style={{ maxWidth: 720, padding: 16 }}>
-      <h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 16 }}>Restricted Content</h2>
+		setSaving(true);
+		setMessage("");
+		try {
+			await api("/admin/restrictions", {
+				method: "POST",
+				body: JSON.stringify(draft),
+			});
+			setDraft({ collectionSlug: "posts", contentId: "", slug: "", title: "", requiredPlanSlugs: [] });
+			await load();
+			setMessage("Restriction saved.");
+		} catch (error) {
+			setMessage(error instanceof Error ? error.message : "Unable to save restriction.");
+		} finally {
+			setSaving(false);
+		}
+	}
 
-      {restrictions.length === 0 ? (
-        <p style={{ color: "#6b7280", fontSize: 14 }}>
-          No content restricted yet. Edit a post or page and click "Restrict" in the toolbar.
-        </p>
-      ) : (
-        <div style={{ border: "1px solid #e5e7eb", borderRadius: 8, overflow: "hidden" }}>
-          {restrictions.map((item, i) => {
-            const d = item.data || item;
-            return (
-              <div key={item.id || i} style={{
-                padding: 12, borderBottom: i < restrictions.length - 1 ? "1px solid #e5e7eb" : "none",
-                display: "flex", justifyContent: "space-between", alignItems: "center",
-              }}>
-                <div>
-                  <div style={{ fontWeight: 500, fontSize: 14 }}>{d.collectionSlug}/{d.contentId}</div>
-                  <div style={{ fontSize: 12, color: "#6b7280" }}>
-                    Products: {(d.productIds || []).map((id: string) => {
-                      const prod = products.find((p: any) => p.id === id);
-                      return prod ? prod.name : id.slice(0, 12) + "...";
-                    }).join(", ") || "none"}
-                  </div>
-                </div>
-                <button onClick={() => remove(item)}
-                  style={{ fontSize: 12, color: "#dc2626", background: "none", border: "none", cursor: "pointer" }}>
-                  Remove
-                </button>
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
+	async function removeRestriction(item: RestrictionRecord) {
+		setSaving(true);
+		try {
+			await api("/admin/restrictions", {
+				method: "DELETE",
+				body: JSON.stringify({
+					collectionSlug: item.data.collectionSlug,
+					contentId: item.data.contentId,
+					slug: item.data.slug || undefined,
+				}),
+			});
+			await load();
+		} catch (error) {
+			setMessage(error instanceof Error ? error.message : "Unable to remove restriction.");
+		} finally {
+			setSaving(false);
+		}
+	}
+
+	return (
+		<div style={{ maxWidth: 760, padding: 16 }}>
+			<h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 16 }}>Restrictions</h2>
+
+			<Section title="Add or update a manual restriction">
+				<div style={{ display: "grid", gap: 12, gridTemplateColumns: "repeat(2, minmax(0, 1fr))" }}>
+					<label>
+						<FieldLabel>Collection slug</FieldLabel>
+						<input value={draft.collectionSlug} onChange={(event) => setDraft({ ...draft, collectionSlug: event.target.value })} style={inputStyle} />
+					</label>
+					<label>
+						<FieldLabel>Content ID</FieldLabel>
+						<input value={draft.contentId} onChange={(event) => setDraft({ ...draft, contentId: event.target.value })} style={inputStyle} />
+					</label>
+					<label>
+						<FieldLabel>Slug (optional)</FieldLabel>
+						<input value={draft.slug} onChange={(event) => setDraft({ ...draft, slug: event.target.value })} style={inputStyle} />
+					</label>
+					<label>
+						<FieldLabel>Title (optional)</FieldLabel>
+						<input value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} style={inputStyle} />
+					</label>
+				</div>
+				<div style={{ marginTop: 14 }}>
+					<FieldLabel>Required plans</FieldLabel>
+					<div style={{ display: "grid", gap: 10 }}>
+						{PAID_PLANS.map((plan) => (
+							<label key={plan.slug} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+								<input
+									type="checkbox"
+									checked={draft.requiredPlanSlugs.includes(plan.slug)}
+									onChange={(event) =>
+										setDraft({
+											...draft,
+											requiredPlanSlugs: event.target.checked
+												? [...draft.requiredPlanSlugs, plan.slug]
+												: draft.requiredPlanSlugs.filter((value) => value !== plan.slug),
+										})
+									}
+								/>
+								<span>{plan.name}</span>
+							</label>
+						))}
+					</div>
+				</div>
+				<div style={{ display: "flex", gap: 12, marginTop: 16 }}>
+					<button type="button" onClick={saveRestriction} disabled={saving} style={buttonStyle}>
+						{saving ? "Saving…" : "Save restriction"}
+					</button>
+				</div>
+			</Section>
+
+			<Section title="Current manual restrictions">
+				{loading ? (
+					<p>Loading…</p>
+				) : restrictions.length === 0 ? (
+					<p style={helpText}>No manual restrictions have been saved yet.</p>
+				) : (
+					<div style={{ border: "1px solid #e5e7eb", borderRadius: 12, overflow: "hidden" }}>
+						{restrictions.map((item, index) => (
+							<div key={item.id || index} style={{ padding: 14, borderBottom: index < restrictions.length - 1 ? "1px solid #e5e7eb" : "none", display: "flex", justifyContent: "space-between", gap: 16 }}>
+								<div>
+									<div style={{ fontWeight: 600 }}>{item.data.title || `${item.data.collectionSlug}/${item.data.slug || item.data.contentId}`}</div>
+									<p style={helpText}>{item.data.collectionSlug} · {item.data.contentId}</p>
+									<p style={captionText}>
+										{(item.data.requiredPlanSlugs || []).map((planSlug) => planLabels[planSlug] || planSlug).join(", ") || "No plans selected"}
+									</p>
+								</div>
+								<div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+									<button type="button" onClick={() => setDraft({
+										collectionSlug: item.data.collectionSlug,
+										contentId: item.data.contentId,
+										slug: item.data.slug || "",
+										title: item.data.title || "",
+										requiredPlanSlugs: item.data.requiredPlanSlugs || [],
+									})} style={ghostButtonStyle}>Edit</button>
+									<button type="button" onClick={() => removeRestriction(item)} style={{ ...ghostButtonStyle, color: "#b91c1c" }}>Remove</button>
+								</div>
+							</div>
+						))}
+					</div>
+				)}
+			</Section>
+
+			{message && <p style={{ ...helpText, color: message.toLowerCase().includes("unable") ? "#b91c1c" : "#166534" }}>{message}</p>}
+		</div>
+	);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Dashboard Widget
-// ═══════════════════════════════════════════════════════════════════
 function OverviewWidget() {
-  const [data, setData] = useState<any>(null);
-  useEffect(() => {
-    Promise.all([api("/admin/settings"), api("/admin/restrictions")])
-      .then(([s, r]) => setData({ connected: s.isConfigured, env: s.stripeEnvironment, count: (r.items || []).length }))
-      .catch(() => setData({ connected: false, count: 0 }));
-  }, []);
-  if (!data) return <p style={{ fontSize: 13 }}>Loading...</p>;
-  return (
-    <div style={{ fontSize: 14 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
-        <span style={{ color: "#6b7280" }}>Stripe</span>
-        <span style={{ fontWeight: 500, color: data.connected ? "#059669" : "#dc2626" }}>
-          {data.connected ? `Connected (${data.env})` : "Not connected"}
-        </span>
-      </div>
-      <div style={{ display: "flex", justifyContent: "space-between" }}>
-        <span style={{ color: "#6b7280" }}>Restricted items</span>
-        <span style={{ fontWeight: 500 }}>{data.count}</span>
-      </div>
-    </div>
-  );
+	const [summary, setSummary] = useState<{
+		connected: boolean;
+		emailConfigured: boolean;
+		mappedPlans: number;
+		restrictionCount: number;
+	} | null>(null);
+
+	useEffect(() => {
+		Promise.all([api<SettingsState>("/admin/settings"), api<{ items: RestrictionRecord[] }>("/admin/restrictions")])
+			.then(([settings, restrictions]) =>
+				setSummary({
+					connected: settings.isConfigured,
+					emailConfigured: settings.emailConfigured,
+					mappedPlans: Object.values(settings.planMappings).filter(Boolean).length,
+					restrictionCount: restrictions.items?.length || 0,
+				}),
+			)
+			.catch(() =>
+				setSummary({ connected: false, emailConfigured: false, mappedPlans: 0, restrictionCount: 0 }),
+			);
+	}, []);
+
+	if (!summary) {
+		return <p style={{ fontSize: 13 }}>Loading…</p>;
+	}
+
+	return (
+		<div style={{ display: "grid", gap: 8, fontSize: 14 }}>
+			<div style={summaryRowStyle}><span>Stripe</span><strong>{summary.connected ? "Connected" : "Not connected"}</strong></div>
+			<div style={summaryRowStyle}><span>Email</span><strong>{summary.emailConfigured ? "Ready" : "Missing"}</strong></div>
+			<div style={summaryRowStyle}><span>Mapped plans</span><strong>{summary.mappedPlans}</strong></div>
+			<div style={summaryRowStyle}><span>Restricted items</span><strong>{summary.restrictionCount}</strong></div>
+		</div>
+	);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Sidebar Panel — Injects toolbar button + restriction modal
-// The panel renders minimal in the sidebar, but also injects a
-// "Restrict" button next to Preview in the editor toolbar.
-// ═══════════════════════════════════════════════════════════════════
-function RestrictionPanel({ collection, entryId, item }: {
-  collection: string; entryId?: string; item?: Record<string, unknown>;
-}) {
-  const [products, setProducts] = useState<any[]>([]);
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [configured, setConfigured] = useState<boolean | null>(null);
-  const [modalOpen, setModalOpen] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
-  const toolbarBtnRef = useRef<HTMLElement | null>(null);
-  const portalContainer = useRef<HTMLDivElement | null>(null);
-
-  // Use slug for restriction keys (matches frontend URL-based lookups)
-  // item.slug is the URL slug; entryId is the database ULID
-  const slug = (item as any)?.slug || (item as any)?.data?.slug || entryId;
-
-  // Load data
-  useEffect(() => {
-    if (!slug) { setLoading(false); return; }
-    api("/admin/settings").then(settings => {
-      setConfigured(settings.isConfigured);
-      if (!settings.isConfigured) { setLoading(false); return; }
-      return Promise.all([
-        api("/admin/products").catch(() => ({ products: [] })),
-        api(`/admin/restrictions?collection=${collection}`).catch(() => ({ items: [] })),
-      ]).then(([prodData, resData]) => {
-        setProducts(prodData.products || []);
-        const items = resData.items || [];
-        const match = items.find((r: any) => (r.data?.contentId || r.contentId) === slug);
-        if (match) setSelectedIds(match.data?.productIds || match.productIds || []);
-        setLoading(false);
-      });
-    }).catch(() => { setConfigured(false); setLoading(false); });
-  }, [slug, collection]);
-
-  // Inject toolbar button next to Preview
-  useEffect(() => {
-    if (loading) return;
-
-    // Create portal container for the modal
-    if (!portalContainer.current) {
-      portalContainer.current = document.createElement("div");
-      document.body.appendChild(portalContainer.current);
-    }
-
-    // Find the toolbar buttons area (the flex container with Preview/Save/Publish)
-    const findAndInject = () => {
-      // Look for the Preview or Save button area
-      const buttons = document.querySelectorAll('button');
-      let targetContainer: Element | null = null;
-      let insertBefore: Element | null = null;
-
-      for (const btn of buttons) {
-        const text = btn.textContent?.trim() || "";
-        if (text === "Preview" || text === "Preview draft") {
-          targetContainer = btn.parentElement;
-          insertBefore = btn;
-          break;
-        }
-      }
-
-      // Fallback: look for Save button
-      if (!targetContainer) {
-        for (const btn of buttons) {
-          if (btn.textContent?.trim() === "Save") {
-            targetContainer = btn.parentElement;
-            insertBefore = btn;
-            break;
-          }
-        }
-      }
-
-      if (!targetContainer || toolbarBtnRef.current?.parentElement === targetContainer) return;
-
-      // Create the Restrict button
-      const restrictBtn = document.createElement("button");
-      restrictBtn.type = "button";
-      restrictBtn.className = (insertBefore as HTMLElement)?.className || "";
-      restrictBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 256 256" fill="currentColor" style="margin-right:4px"><path d="M208,80H176V56a48,48,0,0,0-96,0V80H48A16,16,0,0,0,32,96V208a16,16,0,0,0,16,16H208a16,16,0,0,0,16-16V96A16,16,0,0,0,208,80ZM96,56a32,32,0,0,1,64,0V80H96ZM208,208H48V96H208V208Zm-80-36a12,12,0,1,1,12-12A12,12,0,0,1,128,172Zm20-52a4,4,0,0,1-4,4H112a4,4,0,0,1,0-8h32A4,4,0,0,1,148,120Z"/></svg>`;
-      restrictBtn.innerHTML += selectedIds.length > 0 ? "Restricted" : "Restrict";
-
-      if (selectedIds.length > 0) {
-        restrictBtn.style.color = "#635bff";
-        restrictBtn.style.borderColor = "#635bff";
-      }
-
-      restrictBtn.addEventListener("click", () => setModalOpen(true));
-
-      if (toolbarBtnRef.current) toolbarBtnRef.current.remove();
-      targetContainer.insertBefore(restrictBtn, insertBefore);
-      toolbarBtnRef.current = restrictBtn;
-    };
-
-    // Try immediately, then with MutationObserver for SPA navigation
-    findAndInject();
-    const observer = new MutationObserver(findAndInject);
-    observer.observe(document.body, { childList: true, subtree: true });
-
-    return () => {
-      observer.disconnect();
-      if (toolbarBtnRef.current) toolbarBtnRef.current.remove();
-    };
-  }, [loading, selectedIds, entryId]);
-
-  // Update button text when selection changes
-  useEffect(() => {
-    if (toolbarBtnRef.current) {
-      const hasRestrictions = selectedIds.length > 0;
-      toolbarBtnRef.current.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 256 256" fill="currentColor" style="margin-right:4px"><path d="M208,80H176V56a48,48,0,0,0-96,0V80H48A16,16,0,0,0,32,96V208a16,16,0,0,0,16,16H208a16,16,0,0,0,16-16V96A16,16,0,0,0,208,80ZM96,56a32,32,0,0,1,64,0V80H96ZM208,208H48V96H208V208Zm-80-36a12,12,0,1,1,12-12A12,12,0,0,1,128,172Zm20-52a4,4,0,0,1-4,4H112a4,4,0,0,1,0-8h32A4,4,0,0,1,148,120Z"/></svg>`;
-      toolbarBtnRef.current.innerHTML += hasRestrictions ? "Restricted" : "Restrict";
-      toolbarBtnRef.current.style.color = hasRestrictions ? "#635bff" : "";
-      toolbarBtnRef.current.style.borderColor = hasRestrictions ? "#635bff" : "";
-    }
-  }, [selectedIds]);
-
-  const apply = async (newIds: string[]) => {
-    if (!slug) return;
-    setSaving(true);
-    if (newIds.length === 0) {
-      await api("/admin/restrictions", {
-        method: "DELETE",
-        body: JSON.stringify({ contentId: slug, collectionSlug: collection }),
-      });
-    } else {
-      await api("/admin/restrictions", {
-        method: "POST",
-        body: JSON.stringify({ contentId: slug, collectionSlug: collection, productIds: newIds }),
-      });
-    }
-    setSelectedIds(newIds);
-    setSaving(false);
-    setModalOpen(false);
-  };
-
-  // Render the modal via portal (outside sidebar)
-  const modal = modalOpen && portalContainer.current ? createPortal(
-    <RestrictionModal
-      products={products}
-      selectedIds={selectedIds}
-      configured={configured}
-      error={error}
-      saving={saving}
-      onApply={apply}
-      onClose={() => setModalOpen(false)}
-    />,
-    portalContainer.current,
-  ) : null;
-
-  // Sidebar shows minimal status
-  if (!entryId) return <p style={{ fontSize: 13, color: "#6b7280" }}>Save first.</p>;
-  if (loading) return <p style={{ fontSize: 13, color: "#6b7280" }}>Loading...</p>;
-
-  return (
-    <div>
-      {selectedIds.length > 0 ? (
-        <p style={{ fontSize: 13, color: "#635bff", fontWeight: 500 }}>
-          {selectedIds.length} product{selectedIds.length > 1 ? "s" : ""} required
-        </p>
-      ) : (
-        <p style={{ fontSize: 13, color: "#6b7280" }}>Not restricted</p>
-      )}
-      <button onClick={() => setModalOpen(true)}
-        style={{ fontSize: 13, color: "#635bff", background: "none", border: "none", cursor: "pointer", padding: 0, textDecoration: "underline" }}>
-        {selectedIds.length > 0 ? "Edit restrictions" : "Add restriction"}
-      </button>
-      {modal}
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// Restriction Modal
-// ═══════════════════════════════════════════════════════════════════
-function RestrictionModal({ products, selectedIds, configured, error, saving, onApply, onClose }: {
-  products: any[];
-  selectedIds: string[];
-  configured: boolean | null;
-  error: string;
-  saving: boolean;
-  onApply: (ids: string[]) => void;
-  onClose: () => void;
-}) {
-  const [localIds, setLocalIds] = useState<string[]>(selectedIds);
-
-  const toggle = (productId: string, checked: boolean) => {
-    setLocalIds(checked ? [...localIds, productId] : localIds.filter(id => id !== productId));
-  };
-
-  return (
-    <div style={{
-      position: "fixed", inset: 0, zIndex: 9999,
-      display: "flex", alignItems: "center", justifyContent: "center",
-    }}>
-      {/* Backdrop */}
-      <div onClick={onClose} style={{
-        position: "absolute", inset: 0, background: "rgba(0,0,0,0.4)",
-      }} />
-
-      {/* Dialog */}
-      <div style={{
-        position: "relative", background: "white", borderRadius: 12,
-        padding: 24, minWidth: 360, maxWidth: 480, maxHeight: "80vh", overflowY: "auto",
-        boxShadow: "0 20px 60px rgba(0,0,0,0.3)",
-      }}>
-        <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 16 }}>Restrict With Stripe</h2>
-
-        {configured === false ? (
-          <p style={{ color: "#6b7280" }}>Connect Stripe in RWStripe Settings first.</p>
-        ) : error ? (
-          <p style={{ color: "#dc2626" }}>{error}</p>
-        ) : products.length === 0 ? (
-          <p style={{ color: "#6b7280" }}>No products found. Create products in Stripe first.</p>
-        ) : (
-          <>
-            <p style={{ fontSize: 14, color: "#6b7280", marginBottom: 12 }}>
-              Select which Stripe products are required to view this content:
-            </p>
-            <div style={{ marginBottom: 16 }}>
-              {products.map((p: any) => (
-                <label key={p.id} style={{
-                  display: "flex", alignItems: "center", gap: 8, fontSize: 14,
-                  padding: "8px 0", borderBottom: "1px solid #f3f4f6", cursor: "pointer",
-                }}>
-                  <input type="checkbox" checked={localIds.includes(p.id)}
-                    onChange={e => toggle(p.id, e.target.checked)} />
-                  <div>
-                    <div style={{ fontWeight: 500 }}>{p.name}</div>
-                    {p.description && <div style={{ fontSize: 12, color: "#9ca3af" }}>{p.description}</div>}
-                  </div>
-                </label>
-              ))}
-            </div>
-          </>
-        )}
-
-        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 8 }}>
-          <button onClick={onClose} style={{ ...btnStyle, background: "#e5e7eb", color: "#374151" }}>Cancel</button>
-          {configured !== false && products.length > 0 && (
-            <button onClick={() => onApply(localIds)} disabled={saving}
-              style={{ ...btnStyle, opacity: saving ? 0.6 : 1 }}>
-              {saving ? "Saving..." : "Apply"}
-            </button>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// Exports
-// ═══════════════════════════════════════════════════════════════════
 export const pages = {
-  "/settings": SettingsPage,
-  "/restrictions": RestrictionsPage,
+	"/settings": SettingsPage,
+	"/restrictions": RestrictionsPage,
 };
 
 export const widgets = {
-  overview: OverviewWidget,
+	overview: OverviewWidget,
 };
 
-// Toolbar button + modal handles restriction UI — no sidebar panel needed
+const buttonStyle: React.CSSProperties = {
+	padding: "10px 16px",
+	background: "#111827",
+	color: "#ffffff",
+	borderRadius: 999,
+	border: "none",
+	cursor: "pointer",
+	fontWeight: 600,
+};
 
-// ═══════════════════════════════════════════════════════════════════
-// Shared UI
-// ═══════════════════════════════════════════════════════════════════
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <div style={{ marginBottom: 24 }}>
-      <h3 style={{ fontSize: 15, fontWeight: 600, marginBottom: 8 }}>{title}</h3>
-      {children}
-    </div>
-  );
-}
+const buttonLinkStyle: React.CSSProperties = {
+	...buttonStyle,
+	display: "inline-flex",
+	textDecoration: "none",
+};
 
-const btnStyle: React.CSSProperties = {
-  padding: "8px 16px", background: "#635bff", color: "white",
-  border: "none", borderRadius: 6, cursor: "pointer", fontSize: 14, fontWeight: 500,
+const ghostButtonStyle: React.CSSProperties = {
+	background: "transparent",
+	border: "none",
+	color: "#4b5563",
+	cursor: "pointer",
+	fontWeight: 600,
+	padding: 0,
+};
+
+const linkStyle: React.CSSProperties = {
+	color: "#111827",
+	fontWeight: 600,
+};
+
+const inputStyle: React.CSSProperties = {
+	width: "100%",
+	padding: "10px 12px",
+	borderRadius: 10,
+	border: "1px solid #d1d5db",
+	background: "#ffffff",
+};
+
+const helpText: React.CSSProperties = {
+	margin: 0,
+	fontSize: 13,
+	color: "#6b7280",
+};
+
+const captionText: React.CSSProperties = {
+	margin: "6px 0 0",
+	fontSize: 12,
+	color: "#6b7280",
+};
+
+const summaryRowStyle: React.CSSProperties = {
+	display: "flex",
+	justifyContent: "space-between",
+	gap: 12,
 };
