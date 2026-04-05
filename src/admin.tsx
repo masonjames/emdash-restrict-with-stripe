@@ -244,6 +244,9 @@ function SettingsPage() {
 			</Section>
 
 			<Section title="3. Delivery & gating">
+				<p style={helpText}>
+					Use any EmDash email provider plugin for member auth. EmDash SMTP with Resend is the recommended production setup.
+				</p>
 				<label style={{ display: "flex", alignItems: "center", gap: 8 }}>
 					<input
 						type="checkbox"
@@ -253,7 +256,10 @@ function SettingsPage() {
 					Show excerpts on locked content
 				</label>
 				<p style={{ ...helpText, marginTop: 12 }}>
-					Email provider: <strong>{settings.emailConfigured ? "configured" : "missing"}</strong>
+					Email provider plugin: <strong>{settings.emailConfigured ? "ready" : "not ready"}</strong>
+				</p>
+				<p style={captionText}>
+					If this shows not ready, finish configuring and activating an EmDash email provider plugin before enabling sign-in links.
 				</p>
 			</Section>
 
@@ -459,7 +465,7 @@ function OverviewWidget() {
 	return (
 		<div style={{ display: "grid", gap: 8, fontSize: 14 }}>
 			<div style={summaryRowStyle}><span>Stripe</span><strong>{summary.connected ? "Connected" : "Not connected"}</strong></div>
-			<div style={summaryRowStyle}><span>Email</span><strong>{summary.emailConfigured ? "Ready" : "Missing"}</strong></div>
+			<div style={summaryRowStyle}><span>Email provider</span><strong>{summary.emailConfigured ? "Ready" : "Missing"}</strong></div>
 			<div style={summaryRowStyle}><span>Mapped plans</span><strong>{summary.mappedPlans}</strong></div>
 			<div style={summaryRowStyle}><span>Restricted items</span><strong>{summary.restrictionCount}</strong></div>
 		</div>

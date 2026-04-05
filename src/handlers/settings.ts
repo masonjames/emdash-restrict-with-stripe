@@ -2,6 +2,7 @@ import type { PaidPlanSlug } from "../plans.js";
 import { PAID_PLAN_SLUGS, isPaidPlanSlug } from "../plans.js";
 import { DEFAULT_PLAN_MAPPINGS, type PlanMappings, type RestrictWithStripeSettings, type StripeEnvironment } from "../types.js";
 import { isRecord, uniqueStrings } from "../utils.js";
+import { isEmailReady } from "./auth.js";
 
 export function maskSecretKey(secretKey: string | null | undefined): string {
 	if (!secretKey) {
@@ -67,7 +68,7 @@ export async function loadSettings(ctx: any): Promise<RestrictWithStripeSettings
 		stripeEnvironment,
 		showExcerpts,
 		planMappings,
-		emailConfigured: Boolean(ctx.email),
+		emailConfigured: await isEmailReady(ctx),
 		isConfigured: Boolean(stripeSecretKey),
 	};
 }

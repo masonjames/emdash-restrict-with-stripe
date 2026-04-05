@@ -2,7 +2,7 @@ import { definePlugin } from "emdash";
 
 import { accessHandler } from "./handlers/access.js";
 import { logoutHandler, sendLinkHandler, sessionHandler, verifyHandler } from "./handlers/auth.js";
-import { checkoutHandler } from "./handlers/checkout.js";
+import { checkoutCompleteHandler, checkoutHandler } from "./handlers/checkout.js";
 import { portalHandler } from "./handlers/portal.js";
 import { productsHandler } from "./handlers/products.js";
 import { restrictionsHandler } from "./handlers/restrictions.js";
@@ -33,6 +33,7 @@ export function createPlugin(_options: Record<string, unknown> = {}) {
 		},
 		routes: {
 			checkout: { public: true, handler: checkoutHandler },
+			"checkout/complete": { public: true, handler: checkoutCompleteHandler },
 			portal: { public: true, handler: portalHandler },
 			access: { public: true, handler: accessHandler },
 			"admin/products": { handler: productsHandler },

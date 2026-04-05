@@ -5,6 +5,10 @@ const AUTH_TOKEN_TTL_MS = 15 * 60 * 1000;
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_COOKIE_NAME = "rwstripe_session";
 
+export async function isEmailReady(ctx: any): Promise<boolean> {
+	return Boolean(ctx.email && (await ctx.email.isReady()));
+}
+
 async function invalidateAuthTokensForEmail(ctx: any, email: string) {
 	const tokens = await ctx.storage.authTokens.query({ where: { email }, limit: 100 });
 	await Promise.all(tokens.items.map((item: { id: string }) => ctx.storage.authTokens.delete(item.id)));
@@ -80,24 +84,32 @@ function buildEmailMessage(ctx: any, verifyUrl: string, intent: "signin" | "subs
 	return { subject, text, html };
 }
 
-export async function sendLinkHandler(ctx: any) {
-	const body = isRecord(ctx.input) ? ctx.input : {};
-	const email = normalizeEmail(body.email);
+export async function sendMagicLink(
+	ctx: any,
+	options: {
+		email: string;
+		intent: "signin" | "subscribe-free";
+		redirect: string;
+	},
+) {
+	const email = normalizeEmail(options.email);
 	if (!email) {
-		return { ok: false, error: "A valid email address is required." };
+		throw new Error("A valid email address is required.");
 	}
-	if (!ctx.email) {
-		return { ok: false, error: "Email delivery is not configured for this site yet." };
+	if (!(await isEmailReady(ctx))) {
+		throw new Error("Email delivery is not configured for this site yet.");
 	}
 
-	const intent = body.intent === "subscribe-free" ? "subscribe-free" : "signin";
-	const redirect = sanitizeRedirectPath(body.redirect, intent === "subscribe-free" ? "/resources/#subscribe" : "/");
+	const redirect = sanitizeRedirectPath(
+		options.redirect,
+		options.intent === "subscribe-free" ? "/resources/#subscribe" : "/",
+	);
 	const token = generateToken("rwml_", 40);
 	const authToken: AuthTokenRecord = {
 		email,
 		token,
 		redirect,
-		intent,
+		intent: options.intent,
 		expiresAt: new Date(Date.now() + AUTH_TOKEN_TTL_MS).toISOString(),
 		used: false,
 		createdAt: nowIso(),
@@ -107,8 +119,8 @@ export async function sendLinkHandler(ctx: any) {
 	await ctx.storage.authTokens.put(token, authToken);
 
 	const verifyUrl = buildVerifyUrl(ctx, token, redirect);
-	const message = buildEmailMessage(ctx, verifyUrl, intent);
-	await ctx.email.send({
+	const message = buildEmailMessage(ctx, verifyUrl, options.intent);
+	await ctx.email.sendSystem({
 		to: email,
 		subject: message.subject,
 		text: message.text,
@@ -116,11 +128,35 @@ export async function sendLinkHandler(ctx: any) {
 	});
 
 	return {
-		ok: true,
-		message:
-			intent === "subscribe-free"
+		email,
+		redirect,
+		authToken,
+		verifyUrl,
+		message,
+		responseMessage:
+			options.intent === "subscribe-free"
 				? "Check your inbox to confirm your subscription."
 				: "Check your inbox for a sign-in link.",
+	};
+}
+
+export async function sendLinkHandler(ctx: any) {
+	const body = isRecord(ctx.input) ? ctx.input : {};
+	const email = normalizeEmail(body.email);
+	if (!email) {
+		return { ok: false, error: "A valid email address is required." };
+	}
+	if (!(await isEmailReady(ctx))) {
+		return { ok: false, error: "Email delivery is not configured for this site yet." };
+	}
+
+	const intent = body.intent === "subscribe-free" ? "subscribe-free" : "signin";
+	const redirect = sanitizeRedirectPath(body.redirect, intent === "subscribe-free" ? "/resources/#subscribe" : "/");
+	const result = await sendMagicLink(ctx, { email, intent, redirect });
+
+	return {
+		ok: true,
+		message: result.responseMessage,
 	};
 }
 

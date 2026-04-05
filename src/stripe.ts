@@ -46,6 +46,17 @@ interface StripeInvoiceList {
 	}>;
 }
 
+export interface StripeCheckoutSession {
+	id: string;
+	status?: string | null;
+	payment_status?: string | null;
+	customer?: string | null;
+	customer_email?: string | null;
+	customer_details?: {
+		email?: string | null;
+	} | null;
+}
+
 export class StripeClient {
 	constructor(
 		private readonly secretKey: string,
@@ -145,6 +156,10 @@ export class StripeClient {
 			customer: customerId,
 			return_url: returnUrl,
 		});
+	}
+
+	async getCheckoutSession(id: string): Promise<StripeCheckoutSession> {
+		return this.request<StripeCheckoutSession>(`/checkout/sessions/${encodeURIComponent(id)}`);
 	}
 
 	async customerHasProduct(customerId: string, productIds: string[]): Promise<boolean> {

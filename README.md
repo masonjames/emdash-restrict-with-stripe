@@ -195,24 +195,22 @@ The plugin uses EmDash's plugin storage system (SQLite-backed):
 
 ## Email Configuration
 
-Magic link emails are sent via SMTP. Configure in the plugin's KV store:
+Magic link emails are sent through EmDash's shared email pipeline. This plugin requires any installed EmDash email provider plugin that exposes `email:deliver`.
 
-| Key | Default | Description |
-|---|---|---|
-| `smtp_host` | `127.0.0.1` | SMTP server host |
-| `smtp_port` | `1025` | SMTP server port |
-| `from_email` | `noreply@emdash.local` | Sender email address |
-| `site_name` | `EmDash Site` | Site name in emails |
+Recommended setup:
 
-For local development, use [Mailpit](https://mailpit.axllent.org/) to capture emails.
+1. Install an email provider plugin such as `@masonjames/emdash-smtp`
+2. Add it to your EmDash `plugins: []` list alongside `restrictWithStripe()`
+3. Configure a provider (for example Resend) in **Settings → Email**
+4. Set the provider as the active delivery provider before enabling member sign-in
 
-For production, configure a real SMTP server or update the auth handler to use an email API (Resend, SES, etc.).
+If no email provider is active, `POST /auth/send-link` will fail with `Email delivery is not configured for this site yet.`
 
 ## Requirements
 
 - EmDash CMS v0.1.0+
-- Node.js runtime (not Cloudflare Workers — uses `node:net` for SMTP)
 - A Stripe account with products and prices configured
+- An active EmDash email provider plugin for magic-link delivery
 
 ## WordPress Comparison
 
