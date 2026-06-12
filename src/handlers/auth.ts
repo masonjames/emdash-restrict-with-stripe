@@ -60,7 +60,12 @@ export async function getSessionState(ctx: any): Promise<MemberSessionState> {
 }
 
 function buildVerifyUrl(ctx: any, token: string, redirect: string): string {
-	const verifyUrl = new URL(ctx.url("/account/verify/"));
+	// ctx.url() prefixes the configured site URL; when that setting is empty
+	// (fresh/dev databases) it returns a bare path — fall back to the
+	// request origin so magic links still resolve.
+	const absolute = ctx.url("/account/verify/");
+	const base = ctx.request ? new URL(ctx.request.url).origin : undefined;
+	const verifyUrl = new URL(absolute, base);
 	verifyUrl.searchParams.set("token", token);
 	verifyUrl.searchParams.set("redirect", redirect);
 	return verifyUrl.toString();
