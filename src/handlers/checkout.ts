@@ -5,6 +5,12 @@ import { isRecord, normalizeEmail, sanitizeRedirectPath } from "../utils.js";
 import { isEmailReady, sendMagicLink } from "./auth.js";
 import { loadSettings } from "./settings.js";
 
+function buildAbsoluteUrl(ctx: any, path: string): string {
+	const absolute = ctx.url(path);
+	const base = ctx.request ? new URL(ctx.request.url).origin : undefined;
+	return new URL(absolute, base).toString();
+}
+
 export async function checkoutHandler(ctx: any) {
 	const body = isRecord(ctx.input) ? ctx.input : {};
 	const planSlug = body.planSlug;
@@ -48,7 +54,7 @@ export async function checkoutHandler(ctx: any) {
 	}
 
 	const customer = await findOrCreateCustomerRecord(ctx, stripe, email);
-	const successUrl = new URL(ctx.url("/account/complete/"));
+	const successUrl = new URL(buildAbsoluteUrl(ctx, "/account/complete/"));
 	successUrl.searchParams.set("session_id", "{CHECKOUT_SESSION_ID}");
 	successUrl.searchParams.set("redirect", redirectPath);
 
@@ -56,7 +62,7 @@ export async function checkoutHandler(ctx: any) {
 		priceId: price.id,
 		customerId: customer.stripeCustomerId,
 		successUrl: successUrl.toString(),
-		cancelUrl: ctx.url(redirectPath),
+		cancelUrl: buildAbsoluteUrl(ctx, redirectPath),
 	});
 
 	return { ok: true, url: checkoutSession.url };

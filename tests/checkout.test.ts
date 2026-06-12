@@ -32,6 +32,7 @@ function createStorageCollection<T>() {
 function createCtx(options: {
 	input?: Record<string, unknown>;
 	requestUrl?: string;
+	relativeUrls?: boolean;
 	kvSeed?: Record<string, unknown>;
 	email?: {
 		send?: ReturnType<typeof vi.fn>;
@@ -74,6 +75,9 @@ function createCtx(options: {
 			error: vi.fn(),
 		},
 		url(path: string) {
+			if (options.relativeUrls) {
+				return path;
+			}
 			return new URL(path, "https://site.test").toString();
 		},
 	};
@@ -127,15 +131,18 @@ describe("checkoutHandler", () => {
 			email: {
 				isReady: async () => true,
 			},
+			relativeUrls: true,
 		});
 
 		const result = await checkoutHandler(ctx);
 
 		expect(result).toEqual({ ok: true, url: "https://checkout.stripe.com/pay/cs_test_123" });
 		expect(ctx.storage.sessions.put).not.toHaveBeenCalled();
+		expect(captured?.successUrl).toMatch(/^https:\/\/site\.test\/account\/complete\//);
 		expect(captured?.successUrl).toContain("session_id=%7BCHECKOUT_SESSION_ID%7D");
 		expect(captured?.successUrl).toContain("redirect=%2Fresources%2F%23subscribe");
 		expect(captured?.successUrl).not.toContain("session=");
+		expect(captured?.cancelUrl).toBe("https://site.test/resources/#subscribe");
 	});
 
 	it("refuses to start checkout when the selected email provider is not delivery-ready", async () => {
