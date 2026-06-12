@@ -6,7 +6,9 @@ const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_COOKIE_NAME = "rwstripe_session";
 
 export async function isEmailReady(ctx: any): Promise<boolean> {
-	return Boolean(ctx.email && (await ctx.email.isReady()));
+	// emdash >= 0.16: ctx.email is undefined until an email:deliver provider
+	// is configured, and exposes only send() — presence means ready.
+	return Boolean(ctx.email);
 }
 
 async function invalidateAuthTokensForEmail(ctx: any, email: string) {
@@ -120,7 +122,7 @@ export async function sendMagicLink(
 
 	const verifyUrl = buildVerifyUrl(ctx, token, redirect);
 	const message = buildEmailMessage(ctx, verifyUrl, options.intent);
-	await ctx.email.sendSystem({
+	await ctx.email.send({
 		to: email,
 		subject: message.subject,
 		text: message.text,
