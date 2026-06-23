@@ -36,8 +36,6 @@ function createCtx(options: {
 	kvSeed?: Record<string, unknown>;
 	email?: {
 		send?: ReturnType<typeof vi.fn>;
-		sendSystem?: ReturnType<typeof vi.fn>;
-		isReady?: () => Promise<boolean>;
 	};
 }) {
 	const kvStore = new Map<string, unknown>(Object.entries(options.kvSeed ?? {}));
@@ -129,7 +127,7 @@ describe("checkoutHandler", () => {
 				},
 			},
 			email: {
-				isReady: async () => true,
+				send: vi.fn(async () => undefined),
 			},
 			relativeUrls: true,
 		});
@@ -160,9 +158,6 @@ describe("checkoutHandler", () => {
 					"content-personall-ai": "prod_all_access",
 				},
 			},
-			email: {
-				isReady: async () => false,
-			},
 		});
 
 		await expect(checkoutHandler(ctx)).resolves.toEqual({
@@ -175,7 +170,6 @@ describe("checkoutHandler", () => {
 describe("checkoutCompleteHandler", () => {
 	it("verifies the Stripe checkout session and emails a magic link instead of creating a session", async () => {
 		const send = vi.fn(async () => undefined);
-		const sendSystem = vi.fn(async () => undefined);
 		vi.spyOn(StripeClient.prototype, "getCheckoutSession").mockResolvedValue({
 			id: "cs_test_123",
 			status: "complete",
@@ -190,7 +184,7 @@ describe("checkoutCompleteHandler", () => {
 			kvSeed: {
 				stripe_secret_key: "sk_test_123",
 			},
-			email: { send, sendSystem, isReady: async () => true },
+			email: { send },
 		});
 
 		const result = await checkoutCompleteHandler(ctx);
@@ -199,9 +193,8 @@ describe("checkoutCompleteHandler", () => {
 			ok: true,
 			email: "member@example.com",
 		});
-		expect(send).not.toHaveBeenCalled();
-		expect(sendSystem).toHaveBeenCalledTimes(1);
-		expect(sendSystem).toHaveBeenCalledWith(
+		expect(send).toHaveBeenCalledTimes(1);
+		expect(send).toHaveBeenCalledWith(
 			expect.objectContaining({
 				to: "member@example.com",
 				subject: expect.stringContaining("Sign in"),

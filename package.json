@@ -2,6 +2,9 @@
   "name": "emdash-restrict-with-stripe",
   "version": "0.1.0",
   "type": "module",
+  "scripts": {
+    "test": "vitest run"
+  },
   "main": "src/index.ts",
   "exports": {
     ".": "./src/index.ts",
@@ -12,5 +15,8 @@
   "peerDependencies": {
     "emdash": ">=0.1.0",
     "react": ">=19.0.0"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.9"
   }
 }
